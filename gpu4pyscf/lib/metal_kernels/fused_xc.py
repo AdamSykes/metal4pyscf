@@ -42,22 +42,21 @@ inline float threadgroup_reduce_sum(threadgroup float* sdata, uint tid, uint n) 
 '''
 
 _FUSED_RHO_SOURCE = '''
-uint gid = threadgroup_position_in_grid.x;  // grid point index
-uint tid = thread_position_in_threadgroup.x; // AO index within threadgroup
-
+uint gid = threadgroup_position_in_grid.x;
+uint tid = thread_position_in_threadgroup.x;
 if (gid >= ngrids) return;
 
-// Shared memory for AO values and reduction
 threadgroup float shared_ao[MAX_NAO];
 threadgroup float shared_red[MAX_NAO];
 
-// --- Step 1: each thread computes ao[tid] for this grid point ---
+// --- Step 1: compute spherical AO for this thread ---
+// Each thread computes ALL Cartesian components for its shell,
+// then applies the c2s row to get its spherical AO value.
 float ao_val = 0.0f;
 if (tid < nao) {
-    // Look up which shell this AO belongs to
     int shell_id = ao_to_shell[tid];
-    int ao_start = ao_to_start[tid]; // first AO index of this shell
-    int local_ao = tid - ao_start;   // local index within shell
+    int ncart = c2s_ncart[tid];
+    int c2s_off = c2s_offset[tid];
 
     float acx = shell_data[shell_id * 8 + 0];
     float acy = shell_data[shell_id * 8 + 1];
@@ -78,34 +77,31 @@ if (tid < nao) {
     }
     ce *= fac;
 
-    // Compute the specific Cartesian component for local_ao
-    // This uses the same ordering as the eval_ao kernel
-    if (ang == 0) { ao_val = ce; }
-    else if (ang == 1) {
-        float r[3] = {rx, ry, rz};
-        ao_val = ce * r[local_ao];
-    }
+    // Compute Cartesian components and apply c2s row
+    float cart[15]; // max 15 for l=4
+    if (ang == 0) { cart[0] = ce; }
+    else if (ang == 1) { cart[0]=ce*rx; cart[1]=ce*ry; cart[2]=ce*rz; }
     else if (ang == 2) {
-        // xx, xy, xz, yy, yz, zz
-        float r[3] = {rx, ry, rz};
-        int idx[6][2] = {{0,0},{0,1},{0,2},{1,1},{1,2},{2,2}};
-        ao_val = ce * r[idx[local_ao][0]] * r[idx[local_ao][1]];
+        cart[0]=ce*rx*rx; cart[1]=ce*rx*ry; cart[2]=ce*rx*rz;
+        cart[3]=ce*ry*ry; cart[4]=ce*ry*rz; cart[5]=ce*rz*rz;
     }
     else if (ang == 3) {
-        float r[3] = {rx, ry, rz};
-        int idx[10][3] = {{0,0,0},{0,0,1},{0,0,2},{0,1,1},{0,1,2},
-                          {0,2,2},{1,1,1},{1,1,2},{1,2,2},{2,2,2}};
-        ao_val = ce * r[idx[local_ao][0]] * r[idx[local_ao][1]] * r[idx[local_ao][2]];
+        cart[0]=ce*rx*rx*rx; cart[1]=ce*rx*rx*ry; cart[2]=ce*rx*rx*rz;
+        cart[3]=ce*rx*ry*ry; cart[4]=ce*rx*ry*rz; cart[5]=ce*rx*rz*rz;
+        cart[6]=ce*ry*ry*ry; cart[7]=ce*ry*ry*rz; cart[8]=ce*ry*rz*rz;
+        cart[9]=ce*rz*rz*rz;
     }
 
-    // Apply cart2sph coefficient if needed
-    ao_val *= c2s_coeffs[tid];
+    ao_val = 0.0f;
+    for (int c = 0; c < ncart; c++) {
+        ao_val += c2s_data[c2s_off + c] * cart[c];
+    }
 }
 
 shared_ao[tid] = ao_val;
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-// --- Step 2: compute tmp_i = sum_j dm[i*nao + j] * shared_ao[j] ---
+// --- Step 2: tmp[i] = dm[i,:] @ shared_ao ---
 float tmp = 0.0f;
 if (tid < nao) {
     for (uint j = 0; j < nao; j++) {
@@ -113,7 +109,7 @@ if (tid < nao) {
     }
 }
 
-// --- Step 3: partial[i] = ao[i] * tmp, then reduce ---
+// --- Step 3: reduce rho = sum_i ao[i]*tmp[i] ---
 shared_red[tid] = (tid < nao) ? (ao_val * tmp) : 0.0f;
 float rho_val = threadgroup_reduce_sum(shared_red, tid, MAX_NAO);
 
@@ -125,7 +121,7 @@ if (tid == 0) {
 _fused_rho_kernel = mx.fast.metal_kernel(
     name='fused_rho',
     input_names=['gridx', 'gridy', 'gridz', 'exps', 'coeffs', 'shell_data',
-                 'dm', 'ao_to_shell', 'ao_to_start', 'c2s_coeffs'],
+                 'dm', 'ao_to_shell', 'c2s_data', 'c2s_offset', 'c2s_ncart'],
     output_names=['rho_out'],
     header=_FUSED_RHO_HEADER,
     source=_FUSED_RHO_SOURCE,
@@ -155,9 +151,6 @@ float ao_v = 0.0f, ao_x = 0.0f, ao_y = 0.0f, ao_z = 0.0f;
 
 if (tid < nao) {
     int shell_id = ao_to_shell[tid];
-    int ao_start_v = ao_to_start[tid];
-    int local_ao = tid - ao_start_v;
-
     float acx = shell_data[shell_id * 8 + 0];
     float acy = shell_data[shell_id * 8 + 1];
     float acz = shell_data[shell_id * 8 + 2];
@@ -182,26 +175,58 @@ if (tid < nao) {
     ce *= fac;
     ce_2a *= -2.0f * fac;
 
+    // Compute all Cartesian components + derivatives, apply c2s
+    float cart_v[15], cart_x[15], cart_y[15], cart_z[15];
+    float ax = ce_2a*rx, ay = ce_2a*ry, az = ce_2a*rz;
+
     if (ang == 0) {
-        ao_v = ce;
-        ao_x = ce_2a * rx;
-        ao_y = ce_2a * ry;
-        ao_z = ce_2a * rz;
+        cart_v[0]=ce; cart_x[0]=ax; cart_y[0]=ay; cart_z[0]=az;
     }
     else if (ang == 1) {
-        float r[3] = {rx, ry, rz};
-        float ar[3] = {ce_2a * rx, ce_2a * ry, ce_2a * rz};
-        ao_v = ce * r[local_ao];
-        // d/dx(ce * r[k]) = ce_2a*rx*r[k] + ce*delta(k,0)
-        ao_x = ar[0] * r[local_ao] + ((local_ao == 0) ? ce : 0.0f);
-        ao_y = ar[1] * r[local_ao] + ((local_ao == 1) ? ce : 0.0f);
-        ao_z = ar[2] * r[local_ao] + ((local_ao == 2) ? ce : 0.0f);
+        cart_v[0]=ce*rx;         cart_v[1]=ce*ry;         cart_v[2]=ce*rz;
+        cart_x[0]=ax*rx+ce;      cart_x[1]=ax*ry;         cart_x[2]=ax*rz;
+        cart_y[0]=ay*rx;         cart_y[1]=ay*ry+ce;       cart_y[2]=ay*rz;
+        cart_z[0]=az*rx;         cart_z[1]=az*ry;          cart_z[2]=az*rz+ce;
+    }
+    else if (ang == 2) {
+        cart_v[0]=ce*rx*rx;      cart_v[1]=ce*rx*ry;       cart_v[2]=ce*rx*rz;
+        cart_v[3]=ce*ry*ry;      cart_v[4]=ce*ry*rz;       cart_v[5]=ce*rz*rz;
+        cart_x[0]=(ax*rx+2*ce)*rx; cart_x[1]=(ax*rx+ce)*ry;  cart_x[2]=(ax*rx+ce)*rz;
+        cart_x[3]=ax*ry*ry;       cart_x[4]=ax*ry*rz;       cart_x[5]=ax*rz*rz;
+        cart_y[0]=ay*rx*rx;        cart_y[1]=(ay*ry+ce)*rx;   cart_y[2]=ay*rx*rz;
+        cart_y[3]=(ay*ry+2*ce)*ry; cart_y[4]=(ay*ry+ce)*rz;   cart_y[5]=ay*rz*rz;
+        cart_z[0]=az*rx*rx;        cart_z[1]=az*rx*ry;         cart_z[2]=(az*rz+ce)*rx;
+        cart_z[3]=az*ry*ry;        cart_z[4]=(az*rz+ce)*ry;    cart_z[5]=(az*rz+2*ce)*rz;
+    }
+    else if (ang == 3) {
+        cart_v[0]=ce*rx*rx*rx; cart_v[1]=ce*rx*rx*ry; cart_v[2]=ce*rx*rx*rz;
+        cart_v[3]=ce*rx*ry*ry; cart_v[4]=ce*rx*ry*rz; cart_v[5]=ce*rx*rz*rz;
+        cart_v[6]=ce*ry*ry*ry; cart_v[7]=ce*ry*ry*rz; cart_v[8]=ce*ry*rz*rz;
+        cart_v[9]=ce*rz*rz*rz;
+        cart_x[0]=(ax*rx+3*ce)*rx*rx; cart_x[1]=(ax*rx+2*ce)*rx*ry; cart_x[2]=(ax*rx+2*ce)*rx*rz;
+        cart_x[3]=(ax*rx+ce)*ry*ry;   cart_x[4]=(ax*rx+ce)*ry*rz;   cart_x[5]=(ax*rx+ce)*rz*rz;
+        cart_x[6]=ax*ry*ry*ry;        cart_x[7]=ax*ry*ry*rz;        cart_x[8]=ax*ry*rz*rz;
+        cart_x[9]=ax*rz*rz*rz;
+        cart_y[0]=ay*rx*rx*rx;        cart_y[1]=(ay*ry+ce)*rx*rx;   cart_y[2]=ay*rx*rx*rz;
+        cart_y[3]=(ay*ry+2*ce)*rx*ry; cart_y[4]=(ay*ry+ce)*rx*rz;   cart_y[5]=ay*rx*rz*rz;
+        cart_y[6]=(ay*ry+3*ce)*ry*ry; cart_y[7]=(ay*ry+2*ce)*ry*rz; cart_y[8]=(ay*ry+ce)*rz*rz;
+        cart_y[9]=ay*rz*rz*rz;
+        cart_z[0]=az*rx*rx*rx;        cart_z[1]=az*rx*rx*ry;        cart_z[2]=(az*rz+ce)*rx*rx;
+        cart_z[3]=az*rx*ry*ry;        cart_z[4]=(az*rz+ce)*rx*ry;   cart_z[5]=(az*rz+2*ce)*rx*rz;
+        cart_z[6]=az*ry*ry*ry;        cart_z[7]=(az*rz+ce)*ry*ry;   cart_z[8]=(az*rz+2*ce)*ry*rz;
+        cart_z[9]=(az*rz+3*ce)*rz*rz;
     }
 
-    ao_v *= c2s_coeffs[tid];
-    ao_x *= c2s_coeffs[tid];
-    ao_y *= c2s_coeffs[tid];
-    ao_z *= c2s_coeffs[tid];
+    int ncart = c2s_ncart[tid];
+    int c2s_off = c2s_offset[tid];
+    ao_v = 0; ao_x = 0; ao_y = 0; ao_z = 0;
+    for (int c = 0; c < ncart; c++) {
+        float coeff = c2s_data[c2s_off + c];
+        ao_v += coeff * cart_v[c];
+        ao_x += coeff * cart_x[c];
+        ao_y += coeff * cart_y[c];
+        ao_z += coeff * cart_z[c];
+    }
 }
 
 sh_ao[tid] = ao_v;
@@ -243,7 +268,7 @@ if (tid == 0) {
 _fused_rho_gga_kernel = mx.fast.metal_kernel(
     name='fused_rho_gga',
     input_names=['gridx', 'gridy', 'gridz', 'exps', 'coeffs', 'shell_data',
-                 'dm', 'ao_to_shell', 'ao_to_start', 'c2s_coeffs'],
+                 'dm', 'ao_to_shell', 'c2s_data', 'c2s_offset', 'c2s_ncart'],
     output_names=['rho_out'],
     header=_FUSED_RHO_HEADER,
     source=_FUSED_RHO_GGA_SOURCE,
@@ -251,17 +276,22 @@ _fused_rho_gga_kernel = mx.fast.metal_kernel(
 
 
 def _build_ao_mapping(mol):
-    """Build AO-to-shell mapping and cart2sph coefficients for fused kernel.
+    """Build AO-to-shell mapping and cart2sph data for fused kernel.
 
     Returns:
         ao_to_shell: (nao,) int32 — which shell each spherical AO comes from
-        ao_to_start: (nao,) int32 — first AO index of that shell
-        c2s_coeffs:  (nao,) float32 — cart2sph coefficients (1.0 for s/p)
+        ao_to_start: (nao,) int32 — first spherical AO index of that shell
+        c2s_data:    flat float32 — packed c2s rows for all AOs
+        c2s_offset:  (nao,) int32 — offset into c2s_data for each AO's row
+        c2s_ncart:   (nao,) int32 — number of Cartesian components for each AO's shell
     """
     nao = mol.nao
     ao_to_shell = np.zeros(nao, dtype=np.int32)
     ao_to_start = np.zeros(nao, dtype=np.int32)
-    c2s_coeffs = np.ones(nao, dtype=np.float32)
+    c2s_offset = np.zeros(nao, dtype=np.int32)
+    c2s_ncart = np.zeros(nao, dtype=np.int32)
+    c2s_rows = []
+    data_offset = 0
 
     sph_off = 0
     for ish in range(mol.nbas):
@@ -269,16 +299,33 @@ def _build_ao_mapping(mol):
         ncart = _ncart(l)
         nsph = ncart if l <= 1 else 2 * l + 1
 
-        for i in range(nsph):
-            ao_to_shell[sph_off + i] = ish
-            ao_to_start[sph_off + i] = sph_off
-        # For l >= 2, cart2sph is a matrix, not a simple coefficient.
-        # The fused kernel handles s/p directly and uses the simple
-        # diagonal approximation for d/f (loses accuracy for l>=2).
-        # TODO: proper cart2sph in fused kernel
+        if l <= 1:
+            # s/p: identity transform, one coefficient per AO
+            for i in range(nsph):
+                ao_to_shell[sph_off + i] = ish
+                ao_to_start[sph_off + i] = sph_off
+                c2s_offset[sph_off + i] = data_offset
+                c2s_ncart[sph_off + i] = ncart
+                # Identity row: 1.0 at position i, 0 elsewhere
+                row = np.zeros(ncart, dtype=np.float32)
+                row[i] = 1.0
+                c2s_rows.append(row)
+                data_offset += ncart
+        else:
+            # d/f/g: cart2sph matrix
+            c2s = _cart2sph_matrix(l).astype(np.float32)  # (ncart, nsph)
+            for i in range(nsph):
+                ao_to_shell[sph_off + i] = ish
+                ao_to_start[sph_off + i] = sph_off
+                c2s_offset[sph_off + i] = data_offset
+                c2s_ncart[sph_off + i] = ncart
+                c2s_rows.append(c2s[:, i].copy())  # column i = row for sph AO i
+                data_offset += ncart
+
         sph_off += nsph
 
-    return ao_to_shell, ao_to_start, c2s_coeffs
+    c2s_data = np.concatenate(c2s_rows).astype(np.float32)
+    return ao_to_shell, ao_to_start, c2s_data, c2s_offset, c2s_ncart
 
 
 def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
@@ -291,7 +338,11 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
     nao = mol.nao
     max_l = max(mol.bas_angular(i) for i in range(mol.nbas))
 
-    use_fused_rho = (xctype in ('LDA', 'GGA') and max_l <= 1 and nao <= 1024)
+    # Fused kernel is faster for small molecules (nao <= ~128).
+    # For larger nao, the batched approach with GPU gemm wins because
+    # the dm@ao inner loop (O(nao) per thread) serializes badly,
+    # and nao must be padded to power-of-2 threadgroup size.
+    use_fused_rho = (xctype in ('LDA', 'GGA') and max_l <= 3 and nao <= 128)
 
     if not use_fused_rho:
         # Batched approach (existing, works for all cases)
@@ -301,11 +352,12 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
 
     # --- Fused rho for LDA s/p basis ---
     ngrids = coords.shape[0]
-    ao_to_shell, ao_to_start, c2s_coeffs = _build_ao_mapping(mol)
+    ao_to_shell, ao_to_start, c2s_data, c2s_off, c2s_nc = _build_ao_mapping(mol)
 
     ao_to_shell_gpu = mx.array(ao_to_shell)
-    ao_to_start_gpu = mx.array(ao_to_start)
-    c2s_gpu = mx.array(c2s_coeffs)
+    c2s_data_gpu = mx.array(c2s_data)
+    c2s_off_gpu = mx.array(c2s_off)
+    c2s_nc_gpu = mx.array(c2s_nc)
     dm_gpu = mx.array(np.asarray(dm, dtype=np.float32).ravel())
     shell_data_gpu = mx.array(shell_data.ravel())
 
@@ -320,7 +372,7 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
 
     # MLX grid = total threads, NOT threadgroup count.
     kernel_inputs = [gridx, gridy, gridz, exps_gpu, coeffs_gpu, shell_data_gpu,
-                     dm_gpu, ao_to_shell_gpu, ao_to_start_gpu, c2s_gpu]
+                     dm_gpu, ao_to_shell_gpu, c2s_data_gpu, c2s_off_gpu, c2s_nc_gpu]
     kernel_template = [('ngrids', ngrids), ('nao', nao), ('MAX_NAO', max_nao)]
 
     if xctype == 'LDA':
