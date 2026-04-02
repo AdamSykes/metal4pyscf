@@ -18,12 +18,13 @@ import time
 import platform
 import h5py
 import functools
-import cupy
 import numpy
 import scipy
 import pyscf
 from pyscf import lib
 from pyscf.lib import parameters as param
+from gpu4pyscf.lib.backend import is_device_array as _is_device_array
+from gpu4pyscf.lib.backend import to_host as _to_host
 
 __all__ = ['load_library', 'format_sys_info', 'to_cpu']
 
@@ -81,8 +82,8 @@ def to_cpu(method, out=None):
         if key in cls_keys:
             if hasattr(val, 'to_cpu'):
                 val = val.to_cpu()
-            elif isinstance(val, cupy.ndarray):
-                val = val.get()
+            elif _is_device_array(val):
+                val = _to_host(val)
         setattr(out, key, val)
 
     for key in ['_scf', '_numint']:
@@ -110,15 +111,12 @@ def device(obj):
 def format_sys_info():
     '''Format a list of system information for printing.'''
     import gpu4pyscf
-    from cupyx._runtime import get_runtime_info
+    from gpu4pyscf.lib.backends import BACKEND_NAME
     from gpu4pyscf.__config__ import num_devices, mem_fraction, props as device_props
 
     pyscf_info = lib.repo_info(pyscf.__file__)
     gpu4pyscf_info = lib.repo_info(os.path.join(__file__, '..', '..'))
-    cuda_version = cupy.cuda.runtime.runtimeGetVersion()
-    cuda_version = f"{cuda_version // 1000}.{(cuda_version % 1000) // 10}"
 
-    runtime_info = get_runtime_info()
     result = [
         f'System: {platform.uname()}  Threads {lib.num_threads()}',
         f'Python {sys.version}',
@@ -127,20 +125,40 @@ def format_sys_info():
         f'Date: {time.ctime()}',
         f'PySCF version {pyscf.__version__}',
         f'PySCF path  {pyscf_info["path"]}',
-        'CUDA Environment',
-        f'    CuPy {runtime_info.cupy_version}',
-        f'    CUDA Path {runtime_info.cuda_path}',
-        f'    CUDA Build Version {runtime_info.cuda_build_version}',
-        f'    CUDA Driver Version {runtime_info.cuda_driver_version}',
-        f'    CUDA Runtime Version {runtime_info.cuda_runtime_version}',
-        'CUDA toolkit',
-        f'    cuSolver {runtime_info.cusolver_version}',
-        f'    cuBLAS {runtime_info.cublas_version}',
-        f'    cuTENSOR {runtime_info.cutensor_version}',
+    ]
+
+    if BACKEND_NAME == 'cupy':
+        from cupyx._runtime import get_runtime_info
+        import cupy
+        cuda_version = cupy.cuda.runtime.runtimeGetVersion()
+        cuda_version = f"{cuda_version // 1000}.{(cuda_version % 1000) // 10}"
+        runtime_info = get_runtime_info()
+        result += [
+            'CUDA Environment',
+            f'    CuPy {runtime_info.cupy_version}',
+            f'    CUDA Path {runtime_info.cuda_path}',
+            f'    CUDA Build Version {runtime_info.cuda_build_version}',
+            f'    CUDA Driver Version {runtime_info.cuda_driver_version}',
+            f'    CUDA Runtime Version {runtime_info.cuda_runtime_version}',
+            'CUDA toolkit',
+            f'    cuSolver {runtime_info.cusolver_version}',
+            f'    cuBLAS {runtime_info.cublas_version}',
+            f'    cuTENSOR {runtime_info.cutensor_version}',
+        ]
+    elif BACKEND_NAME == 'mlx':
+        try:
+            import mlx.core as mx
+            result.append(f'MLX version {mx.__version__}')
+        except (ImportError, AttributeError):
+            result.append('MLX Environment (version unknown)')
+    else:
+        result.append(f'Backend: {BACKEND_NAME} (CPU only)')
+
+    result += [
         'Device info',
-        f'    Device name {device_props["name"]}',
-        f'    Device global memory {device_props["totalGlobalMem"] / 1024**3:.2f} GB',
-        f'    CuPy memory fraction {mem_fraction}',
+        f'    Device name {device_props.get("name", "Unknown")}',
+        f'    Device global memory {device_props.get("totalGlobalMem", 0) / 1024**3:.2f} GB',
+        f'    Memory fraction {mem_fraction}',
         f'    Num. Devices {num_devices}',
         f'GPU4PySCF {gpu4pyscf.__version__}',
         f'GPU4PySCF path  {gpu4pyscf_info["path"]}'

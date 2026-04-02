@@ -14,173 +14,250 @@
 
 # modified by Xiaojie Wu (wxj6000@gmail.com)
 
-import cupy
+import numpy as np
 from pyscf.dft import rks
+from pyscf import dft as pyscf_dft
 from gpu4pyscf.lib import logger
-from gpu4pyscf.dft import numint, gen_grid
-from gpu4pyscf.scf import hf, j_engine
-from gpu4pyscf.lib.cupy_helper import tag_array, asarray
+from gpu4pyscf.scf import hf
+from gpu4pyscf.lib.backend import BACKEND_NAME
 from pyscf import __config__
+
+if BACKEND_NAME == 'cupy':
+    import cupy
+    from gpu4pyscf.dft import numint, gen_grid
+    from gpu4pyscf.scf import j_engine
+    from gpu4pyscf.lib.cupy_helper import tag_array, asarray
+else:
+    from pyscf.dft import numint as numint_cpu, gen_grid as gen_grid_cpu
+    from gpu4pyscf.scf.hf import tag_array, asarray
 
 __all__ = [
     'get_veff', 'RKS', 'KohnShamDFT',
 ]
 
-def prune_small_rho_grids_(ks, mol, dm, grids):
-    '''Prune grids if the electron density on the grid is small'''
-    threshold = ks.small_rho_cutoff
-    rho = ks._numint.get_rho(mol, dm, grids, ks.max_memory, verbose=ks.verbose)
-    return grids.prune_by_density_(rho, threshold)
 
-def initialize_grids(ks, mol=None, dm=None):
-    # Initialize self.grids the first time call get_veff
-    if mol is None: mol = ks.mol
+def _initialize_grids_cpu(ks, mol, dm):
+    """Build grids using PySCF CPU grid generation."""
     if ks.grids.coords is None:
         t0 = logger.init_timer(ks)
         ks.grids.build()
-        #ks.grids.build(with_non0tab=True)
-        ks.grids.weights = asarray(ks.grids.weights)
-        ks.grids.coords = asarray(ks.grids.coords)
-        ground_state = getattr(dm, 'ndim', 0) == 2
-        if ks.small_rho_cutoff > 1e-20 and ground_state:
-            # Filter grids the first time setup grids
-            ks.grids = prune_small_rho_grids_(ks, ks.mol, dm, ks.grids)
         t0 = logger.timer_debug1(ks, 'setting up grids', *t0)
 
-    if ks.do_nlc() and ks.nlcgrids.coords is None:
+
+if BACKEND_NAME == 'cupy':
+    def prune_small_rho_grids_(ks, mol, dm, grids):
+        '''Prune grids if the electron density on the grid is small'''
+        threshold = ks.small_rho_cutoff
+        rho = ks._numint.get_rho(mol, dm, grids, ks.max_memory, verbose=ks.verbose)
+        return grids.prune_by_density_(rho, threshold)
+
+    def initialize_grids(ks, mol=None, dm=None):
+        if mol is None: mol = ks.mol
+        if ks.grids.coords is None:
+            t0 = logger.init_timer(ks)
+            ks.grids.build()
+            ks.grids.weights = asarray(ks.grids.weights)
+            ks.grids.coords = asarray(ks.grids.coords)
+            ground_state = getattr(dm, 'ndim', 0) == 2
+            if ks.small_rho_cutoff > 1e-20 and ground_state:
+                ks.grids = prune_small_rho_grids_(ks, ks.mol, dm, ks.grids)
+            t0 = logger.timer_debug1(ks, 'setting up grids', *t0)
+
+        if ks.do_nlc() and ks.nlcgrids.coords is None:
+            t0 = logger.init_timer(ks)
+            ks.nlcgrids.build()
+            ks.nlcgrids.weights = asarray(ks.nlcgrids.weights)
+            ks.nlcgrids.coords = asarray(ks.nlcgrids.coords)
+            if ks.small_rho_cutoff > 1e-20 and ground_state:
+                ks.nlcgrids = prune_small_rho_grids_(ks, ks.mol, dm, ks.nlcgrids)
+            t0 = logger.timer_debug1(ks, 'setting up nlc grids', *t0)
+        return ks
+
+    def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+        '''Coulomb + XC functionals (GPU path)'''
+        if mol is None: mol = ks.mol
+        if dm is None: dm = ks.make_rdm1()
         t0 = logger.init_timer(ks)
-        #ks.nlcgrids.build(with_non0tab=True)
-        ks.nlcgrids.build()
-        ks.nlcgrids.weights = asarray(ks.nlcgrids.weights)
-        ks.nlcgrids.coords = asarray(ks.nlcgrids.coords)
-        if ks.small_rho_cutoff > 1e-20 and ground_state:
-            # Filter grids the first time setup grids
-            ks.nlcgrids = prune_small_rho_grids_(ks, ks.mol, dm, ks.nlcgrids)
-        t0 = logger.timer_debug1(ks, 'setting up nlc grids', *t0)
-    return ks
+        initialize_grids(ks, mol, dm)
 
-def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
-    '''Coulomb + XC functionals
-    .. note::
-        This function will modify the input ks object.
-    Args:
-        ks : an instance of :class:`RKS`
-            XC functional are controlled by ks.xc attribute.  Attribute
-            ks.grids might be initialized.
-        dm : ndarray or list of ndarrays
-            A density matrix or a list of density matrices
-    Kwargs:
-        dm_last : ndarray or a list of ndarrays or 0
-            The density matrix baseline.  If not 0, this function computes the
-            increment of HF potential w.r.t. the reference HF potential matrix.
-        vhf_last : ndarray or a list of ndarrays or 0
-            The reference Vxc potential matrix.
-        hermi : int
-            Whether J, K matrix is hermitian
-            | 0 : no hermitian or symmetric
-            | 1 : hermitian
-            | 2 : anti-hermitian
-    Returns:
-        matrix Veff = J + Vxc.  Veff can be a list matrices, if the input
-        dm is a list of density matrices.
-    '''
+        ni = ks._numint
+        if hermi == 2:
+            n, exc, vxc = 0, 0, 0
+        else:
+            n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm)
+            if ks.do_nlc():
+                if ni.libxc.is_nlc(ks.xc):
+                    xc = ks.xc
+                else:
+                    assert ni.libxc.is_nlc(ks.nlc)
+                    xc = ks.nlc
+                n, enlc, vnlc = ni.nr_nlc_vxc(mol, ks.nlcgrids, xc, dm)
+                exc += enlc
+                vxc += vnlc
+            logger.debug(ks, 'nelec by numeric integration = %s', n)
+        t0 = logger.timer(ks, 'vxc', *t0)
 
-    if mol is None: mol = ks.mol
-    if dm is None: dm = ks.make_rdm1()
-    t0 = logger.init_timer(ks)
-    initialize_grids(ks, mol, dm)
-
-    ni = ks._numint
-    if hermi == 2:  # because rho = 0
-        n, exc, vxc = 0, 0, 0
-    else:
-        n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm)
-        if ks.do_nlc():
-            if ni.libxc.is_nlc(ks.xc):
-                xc = ks.xc
-            else:
-                assert ni.libxc.is_nlc(ks.nlc)
-                xc = ks.nlc
-            n, enlc, vnlc = ni.nr_nlc_vxc(mol, ks.nlcgrids, xc, dm)
-
-            exc += enlc
-            vxc += vnlc
-        logger.debug(ks, 'nelec by numeric integration = %s', n)
-    t0 = logger.timer(ks, 'vxc', *t0)
-
-    dm_orig = dm
-    vj_last = getattr(vhf_last, 'vj', None)
-    if vj_last is not None:
-        dm = asarray(dm) - asarray(dm_last)
-    vj = ks.get_j(mol, dm, hermi)
-    if vj_last is not None:
-        vj += asarray(vj_last)
-    vxc += vj
-    ecoul = float(cupy.einsum('ij,ij', dm_orig, vj).real) * .5
-
-    vk = None
-    if ni.libxc.is_hybrid_xc(ks.xc):
-        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
-        if omega == 0:
-            vk = ks.get_k(mol, dm, hermi)
-            vk *= hyb
-        elif alpha == 0: # LR=0, only SR exchange
-            vk = ks.get_k(mol, dm, hermi, omega=-omega)
-            vk *= hyb
-        elif hyb == 0: # SR=0, only LR exchange
-            vk = ks.get_k(mol, dm, hermi, omega=omega)
-            vk *= alpha
-        else: # SR and LR exchange with different ratios
-            vk = ks.get_k(mol, dm, hermi)
-            vk *= hyb
-            vklr = ks.get_k(mol, dm, hermi, omega=omega)
-            vklr *= (alpha - hyb)
-            vk += vklr
-        vk *= .5
+        dm_orig = dm
+        vj_last = getattr(vhf_last, 'vj', None)
         if vj_last is not None:
-            vk += asarray(vhf_last.vk)
-        vxc -= vk
-        exc -= float(cupy.einsum('ij,ij', dm_orig, vk).real) * .5
-    t0 = logger.timer(ks, 'veff', *t0)
-    vxc = tag_array(vxc, ecoul=ecoul, exc=exc, vj=vj, vk=vk)
-    return vxc
+            dm = asarray(dm) - asarray(dm_last)
+        vj = ks.get_j(mol, dm, hermi)
+        if vj_last is not None:
+            vj += asarray(vj_last)
+        vxc += vj
+        ecoul = float(cupy.einsum('ij,ij', dm_orig, vj).real) * .5
 
-def energy_elec(ks, dm=None, h1e=None, vhf=None):
-    r'''Electronic part of RKS energy.
+        vk = None
+        if ni.libxc.is_hybrid_xc(ks.xc):
+            omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
+            if omega == 0:
+                vk = ks.get_k(mol, dm, hermi)
+                vk *= hyb
+            elif alpha == 0:
+                vk = ks.get_k(mol, dm, hermi, omega=-omega)
+                vk *= hyb
+            elif hyb == 0:
+                vk = ks.get_k(mol, dm, hermi, omega=omega)
+                vk *= alpha
+            else:
+                vk = ks.get_k(mol, dm, hermi)
+                vk *= hyb
+                vklr = ks.get_k(mol, dm, hermi, omega=omega)
+                vklr *= (alpha - hyb)
+                vk += vklr
+            vk *= .5
+            if vj_last is not None:
+                vk += asarray(vhf_last.vk)
+            vxc -= vk
+            exc -= float(cupy.einsum('ij,ij', dm_orig, vk).real) * .5
+        t0 = logger.timer(ks, 'veff', *t0)
+        vxc = tag_array(vxc, ecoul=ecoul, exc=exc, vj=vj, vk=vk)
+        return vxc
 
-    Note this function has side effects which cause mf.scf_summary updated.
+    def energy_elec(ks, dm=None, h1e=None, vhf=None):
+        if dm is None: dm = ks.make_rdm1()
+        if h1e is None: h1e = ks.get_hcore()
+        if vhf is None: vhf = ks.get_veff(ks.mol, dm)
+        e1 = cupy.einsum('ij,ji->', h1e, dm).get()[()].real
+        ecoul = vhf.ecoul.real
+        exc = vhf.exc.real
+        if isinstance(ecoul, cupy.ndarray):
+            ecoul = ecoul.get()[()]
+        if isinstance(exc, cupy.ndarray):
+            exc = exc.get()[()]
+        e2 = ecoul + exc
+        ks.scf_summary['e1'] = e1
+        ks.scf_summary['coul'] = ecoul
+        ks.scf_summary['exc'] = exc
+        logger.debug(ks, 'E1 = %s  Ecoul = %s  Exc = %s', e1, ecoul, exc)
+        return e1+e2, e2
 
-    Args:
-        ks : an instance of DFT class
+else:
+    # ---------------------------------------------------------------------------
+    # Non-CuPy backend: delegate XC evaluation to PySCF CPU
+    # ---------------------------------------------------------------------------
 
-        dm : 2D ndarray
-            one-partical density matrix
-        h1e : 2D ndarray
-            Core hamiltonian
+    def initialize_grids(ks, mol=None, dm=None):
+        if mol is None: mol = ks.mol
+        _initialize_grids_cpu(ks, mol, dm)
+        return ks
 
-    Returns:
-        RKS electronic energy and the 2-electron contribution
-    '''
-    if dm is None: dm = ks.make_rdm1()
-    if h1e is None: h1e = ks.get_hcore()
-    if vhf is None: vhf = ks.get_veff(ks.mol, dm)
-    e1 = cupy.einsum('ij,ji->', h1e, dm).get()[()].real
-    ecoul = vhf.ecoul.real
-    exc = vhf.exc.real
-    if isinstance(ecoul, cupy.ndarray):
-        ecoul = ecoul.get()[()]
-    if isinstance(exc, cupy.ndarray):
-        exc = exc.get()[()]
-    e2 = ecoul + exc
-    ks.scf_summary['e1'] = e1
-    ks.scf_summary['coul'] = ecoul
-    ks.scf_summary['exc'] = exc
-    logger.debug(ks, 'E1 = %s  Ecoul = %s  Exc = %s', e1, ecoul, exc)
-    return e1+e2, e2
+    def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+        '''Coulomb + XC functionals (Metal GPU accelerated path).
 
-# Inherit pyscf KohnShamDFT class since this is tested in the pyscf dispersion code.
-# Note: This class inherits from pyscf.dft.rks.KohnShamDFT and uses its do_nlc method,
-# which relies on pyscf.scf.dispersion.parse_dft. It does NOT use gpu4pyscf.scf.dispersion.parse_dft.
+        Uses Metal GPU for Vxc contraction via numint_metal.
+        '''
+        if mol is None: mol = ks.mol
+        if dm is None: dm = ks.make_rdm1()
+        t0 = logger.init_timer(ks)
+        initialize_grids(ks, mol, dm)
+
+        dm_np = np.asarray(dm)
+        ni = ks._numint
+
+        if hermi == 2:
+            n, exc, vxc = 0, 0, np.zeros_like(dm_np)
+        else:
+            if BACKEND_NAME == 'mlx':
+                try:
+                    import importlib.util as _ilu, os as _os
+                    _spec = _ilu.spec_from_file_location(
+                        'numint_metal',
+                        _os.path.join(_os.path.dirname(__file__), 'numint_metal.py'))
+                    _mod = _ilu.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    n, exc, vxc = _mod.nr_rks_metal(ni, mol, ks.grids, ks.xc, dm_np)
+                except Exception:
+                    n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm_np)
+            else:
+                n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm_np)
+            if ks.do_nlc():
+                if ni.libxc.is_nlc(ks.xc):
+                    xc = ks.xc
+                else:
+                    assert ni.libxc.is_nlc(ks.nlc)
+                    xc = ks.nlc
+                n, enlc, vnlc = ni.nr_nlc_vxc(mol, ks.nlcgrids, xc, dm_np)
+                exc += enlc
+                vxc += vnlc
+            logger.debug(ks, 'nelec by numeric integration = %s', n)
+        t0 = logger.timer(ks, 'vxc', *t0)
+
+        dm_orig = dm_np
+        vj_last = getattr(vhf_last, 'vj', None)
+        if vj_last is not None:
+            dm_np = np.asarray(dm) - np.asarray(dm_last)
+        vj = ks.get_j(mol, dm_np, hermi)
+        if vj_last is not None:
+            vj = np.asarray(vj) + np.asarray(vj_last)
+        vxc = np.asarray(vxc) + np.asarray(vj)
+        ecoul = float(np.einsum('ij,ij', dm_orig, vj).real) * .5
+
+        vk = None
+        if ni.libxc.is_hybrid_xc(ks.xc):
+            omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
+            if omega == 0:
+                vk = ks.get_k(mol, dm_np, hermi)
+                vk = np.asarray(vk) * hyb
+            elif alpha == 0:
+                vk = ks.get_k(mol, dm_np, hermi, omega=-omega)
+                vk = np.asarray(vk) * hyb
+            elif hyb == 0:
+                vk = ks.get_k(mol, dm_np, hermi, omega=omega)
+                vk = np.asarray(vk) * alpha
+            else:
+                vk = ks.get_k(mol, dm_np, hermi)
+                vk = np.asarray(vk) * hyb
+                vklr = ks.get_k(mol, dm_np, hermi, omega=omega)
+                vk += np.asarray(vklr) * (alpha - hyb)
+            vk *= .5
+            if vj_last is not None:
+                vk = np.asarray(vk) + np.asarray(vhf_last.vk)
+            vxc = vxc - vk
+            exc -= float(np.einsum('ij,ij', dm_orig, vk).real) * .5
+        t0 = logger.timer(ks, 'veff', *t0)
+        vxc = tag_array(vxc, ecoul=ecoul, exc=exc, vj=vj, vk=vk)
+        return vxc
+
+    def energy_elec(ks, dm=None, h1e=None, vhf=None):
+        if dm is None: dm = ks.make_rdm1()
+        if h1e is None: h1e = ks.get_hcore()
+        if vhf is None: vhf = ks.get_veff(ks.mol, dm)
+        e1 = float(np.einsum('ij,ji->', h1e, dm).real)
+        ecoul = float(vhf.ecoul)
+        exc = float(vhf.exc)
+        e2 = ecoul + exc
+        ks.scf_summary['e1'] = e1
+        ks.scf_summary['coul'] = ecoul
+        ks.scf_summary['exc'] = exc
+        logger.debug(ks, 'E1 = %s  Ecoul = %s  Exc = %s', e1, ecoul, exc)
+        return e1+e2, e2
+
+
+# ---------------------------------------------------------------------------
+# KohnShamDFT mixin and RKS class
+# ---------------------------------------------------------------------------
+
 class KohnShamDFT(rks.KohnShamDFT):
 
     _keys = {'cphf_grids', *rks.KohnShamDFT._keys}
@@ -193,7 +270,6 @@ class KohnShamDFT(rks.KohnShamDFT):
     to_uks = NotImplemented
     to_gks = NotImplemented
 
-    # Use rho to filter grids
     small_rho_cutoff = getattr(__config__, 'dft_rks_RKS_small_rho_cutoff', 0)
 
     def __init__(self, xc='LDA,VWN'):
@@ -201,22 +277,31 @@ class KohnShamDFT(rks.KohnShamDFT):
         self.disp = None
         self.disp_with_3body = None
         self.nlc = ''
-        self.grids = gen_grid.Grids(self.mol)
+
+        if BACKEND_NAME == 'cupy':
+            self.grids = gen_grid.Grids(self.mol)
+        else:
+            self.grids = pyscf_dft.gen_grid.Grids(self.mol)
+
         self.grids.level = getattr(
             __config__, 'dft_rks_RKS_grids_level', self.grids.level)
-        self.nlcgrids = gen_grid.Grids(self.mol)
+
+        if BACKEND_NAME == 'cupy':
+            self.nlcgrids = gen_grid.Grids(self.mol)
+            self.cphf_grids = gen_grid.Grids(self.mol)
+        else:
+            self.nlcgrids = pyscf_dft.gen_grid.Grids(self.mol)
+            self.cphf_grids = pyscf_dft.gen_grid.Grids(self.mol)
+
         self.nlcgrids.level = getattr(
             __config__, 'dft_rks_RKS_nlcgrids_level', self.nlcgrids.level)
-        
-        # Default CPHF grids is SG1 grids
-        # Reference:
-        # https://gaussian.com/integral/?tabid=1#Integral_keyword__Grid_option
-        self.cphf_grids = gen_grid.Grids(self.mol)
-        self.cphf_grids.prune = gen_grid.sg1_prune
+        self.cphf_grids.prune = pyscf_dft.gen_grid.sg1_prune
         self.cphf_grids.atom_grid = (50,194)
-##################################################
-# don't modify the following attributes, they are not input options
-        self._numint = numint.NumInt()
+
+        if BACKEND_NAME == 'cupy':
+            self._numint = numint.NumInt()
+        else:
+            self._numint = pyscf_dft.numint.NumInt()
 
     @property
     def omega(self):
@@ -250,13 +335,14 @@ class KohnShamDFT(rks.KohnShamDFT):
         self.grids.reset(mol)
         self.nlcgrids.reset(mol)
         self._numint.reset()
-        # The cphf_grids attribute is not available in the PySCF CPU version.
-        # In PySCF's to_gpu() function, this attribute is not initialized.
         if hasattr(self, 'cphf_grids'):
             self.cphf_grids.reset(self.mol)
         else:
-            cphf_grids = self.cphf_grids = gen_grid.Grids(self.mol)
-            cphf_grids.prune = gen_grid.sg1_prune
+            if BACKEND_NAME == 'cupy':
+                cphf_grids = self.cphf_grids = gen_grid.Grids(self.mol)
+            else:
+                cphf_grids = self.cphf_grids = pyscf_dft.gen_grid.Grids(self.mol)
+            cphf_grids.prune = pyscf_dft.gen_grid.sg1_prune
             cphf_grids.atom_grid = (50,194)
         return self
 
@@ -279,8 +365,8 @@ class RKS(KohnShamDFT, hf.RHF):
         return KohnShamDFT.dump_flags(self, verbose)
 
     def Gradients(self):
-        from gpu4pyscf.grad import rks as rks_grad
-        return rks_grad.Gradients(self)
+        from gpu4pyscf.grad import RKS as RKSGrad
+        return RKSGrad(self)
 
     def to_cpu(self):
         mf = rks.RKS(self.mol)

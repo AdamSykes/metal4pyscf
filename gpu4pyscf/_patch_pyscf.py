@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import numpy as np
-import cupy
 import pyscf
+from gpu4pyscf.lib.backend import xp, is_device_array, to_device
 from pyscf import lib
 
 pyscf_version = int(pyscf.__version__.split('.')[1])
@@ -285,7 +285,7 @@ if pyscf_version <= 11:
             # Convert only the keys that are defined in the corresponding GPU class
             if key in cls_keys and key not in misc._ATTRIBUTES_IN_NPARRAY:
                 if isinstance(val, np.ndarray):
-                    val = cupy.asarray(val)
+                    val = to_device(val)
                 elif hasattr(val, 'to_gpu'):
                     val = val.to_gpu()
             setattr(out, key, val)
@@ -329,10 +329,15 @@ if pyscf_version <= 11:
             return misc.to_gpu(self, self.base.to_gpu().Hessian())
         smd_hess.WithSolventHess.to_gpu = _smd_hessian_to_gpu
 
-    from gpu4pyscf.gto import mole as mole_gpu
     from pyscf.pbc.gto import cell
-    mole.Mole.to_gpu = lambda mol: mol.view(mole_gpu.Mole)
-    cell.Cell.to_gpu = lambda cell: cell.view(mole_gpu.Cell)
+    def _mole_to_gpu(mol):
+        from gpu4pyscf.gto import mole as mole_gpu
+        return mol.view(mole_gpu.Mole)
+    def _cell_to_gpu(cell_obj):
+        from gpu4pyscf.gto import mole as mole_gpu
+        return cell_obj.view(mole_gpu.Cell)
+    mole.Mole.to_gpu = _mole_to_gpu
+    cell.Cell.to_gpu = _cell_to_gpu
 
 if pyscf_version <= 12:
     from pyscf.solvent.pcm import PCM

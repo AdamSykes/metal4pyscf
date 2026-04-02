@@ -16,8 +16,29 @@ __version__ = '1.6.1'
 
 from . import _patch_pyscf
 
-from . import lib, grad, hessian, solvent, scf, dft, tdscf, nac
+from gpu4pyscf.lib.backends import BACKEND_NAME
 
-# Overwrite the cupy memory allocator. Make memory pool manage small-sized
-# arrays only.
-lib.cupy_helper.set_conditional_mempool_malloc()
+from . import lib
+
+# Backend-specific memory pool setup
+if BACKEND_NAME == 'cupy':
+    # Overwrite the cupy memory allocator. Make memory pool manage small-sized
+    # arrays only.
+    lib.cupy_helper.set_conditional_mempool_malloc()
+
+# Import submodules. On non-CUDA backends some may fail due to unported
+# cupy dependencies — import them lazily so the package itself stays usable.
+import importlib as _importlib
+
+def __getattr__(name):
+    _submodules = {'grad', 'hessian', 'solvent', 'scf', 'dft', 'tdscf', 'nac'}
+    if name in _submodules:
+        try:
+            return _importlib.import_module(f'.{name}', __name__)
+        except ImportError as e:
+            raise ImportError(
+                f'gpu4pyscf.{name} is not available with the {BACKEND_NAME} '
+                f'backend. The module requires components that have not been '
+                f'ported yet. Original error: {e}'
+            ) from e
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

@@ -12,101 +12,177 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cupy
+import numpy as np
 from pyscf.dft import uks as uks_cpu
 from pyscf import lib
 from gpu4pyscf.lib import logger
 from gpu4pyscf.dft import rks
-from gpu4pyscf.scf import hf, uhf, j_engine
-from gpu4pyscf.lib.cupy_helper import tag_array, asarray
+from gpu4pyscf.scf import hf, uhf
+from gpu4pyscf.scf.hf import tag_array, asarray, BACKEND_NAME
 from gpu4pyscf.lib import utils
 
+if BACKEND_NAME == 'cupy':
+    import cupy
+    from gpu4pyscf.scf import j_engine
 
-def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
-    '''Coulomb + XC functional for UKS.  See pyscf/dft/rks.py
-    :func:`get_veff` fore more details.
-    '''
-    if mol is None: mol = ks.mol
-    if dm is None: dm = ks.make_rdm1()
-    if isinstance(dm, cupy.ndarray) and dm.ndim == 2:
-        dm = cupy.asarray((dm*.5,dm*.5))
-    else:
-        dm = asarray(dm)
-    assert dm.ndim == 3
-    t0 = logger.init_timer(ks)
-    if ks.grids.coords is None:
+
+if BACKEND_NAME == 'cupy':
+    def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+        '''Coulomb + XC functional for UKS (GPU path).'''
+        if mol is None: mol = ks.mol
+        if dm is None: dm = ks.make_rdm1()
+        if isinstance(dm, cupy.ndarray) and dm.ndim == 2:
+            dm = cupy.asarray((dm*.5,dm*.5))
+        else:
+            dm = asarray(dm)
+        assert dm.ndim == 3
+        t0 = logger.init_timer(ks)
+        if ks.grids.coords is None:
+            rks.initialize_grids(ks, mol, dm[0]+dm[1])
+
+        ground_state = getattr(dm, 'ndim', 0) == 3
+        ni = ks._numint
+        if hermi == 2:
+            n, exc, vxc = (0,0), 0, 0
+        else:
+            max_memory = ks.max_memory - lib.current_memory()[0]
+            n, exc, vxc = ni.nr_uks(mol, ks.grids, ks.xc, dm.view(cupy.ndarray), max_memory=max_memory)
+            logger.debug(ks, 'nelec by numeric integration = %s', n)
+            if ks.do_nlc():
+                if ni.libxc.is_nlc(ks.xc):
+                    xc = ks.xc
+                else:
+                    assert ni.libxc.is_nlc(ks.nlc)
+                    xc = ks.nlc
+                n, enlc, vnlc = ni.nr_nlc_vxc(mol, ks.nlcgrids, xc, dm)
+                exc += enlc
+                vxc += vnlc
+            t0 = logger.timer(ks, 'vxc', *t0)
+
+        dm_orig = dm
+        vj_last = getattr(vhf_last, 'vj', None)
+        if vj_last is not None:
+            dm = asarray(dm) - asarray(dm_last)
+        vj = ks.get_j(mol, dm[0]+dm[1], hermi)
+        if vj_last is not None:
+            vj += asarray(vj_last)
+        vxc += vj
+        if ground_state:
+            ecoul = float(cupy.einsum('nij,ij->', dm_orig, vj).real) * .5
+        else:
+            ecoul = None
+
+        vk = None
+        if ni.libxc.is_hybrid_xc(ks.xc):
+            omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
+            if omega == 0:
+                vk = ks.get_k(mol, dm, hermi)
+                vk *= hyb
+            elif alpha == 0:
+                vk = ks.get_k(mol, dm, hermi, omega=-omega)
+                vk *= hyb
+            elif hyb == 0:
+                vk = ks.get_k(mol, dm, hermi, omega=omega)
+                vk *= alpha
+            else:
+                vk = ks.get_k(mol, dm, hermi)
+                vk *= hyb
+                vklr = ks.get_k(mol, dm, hermi, omega=omega)
+                vklr *= (alpha - hyb)
+                vk += vklr
+            if vj_last is not None:
+                vk += asarray(vhf_last.vk)
+            vxc -= vk
+            if ground_state:
+                exc -= float(cupy.einsum('nij,nij', dm_orig, vk).real) * .5
+        t0 = logger.timer(ks, 'veff', *t0)
+        vxc = tag_array(vxc, ecoul=ecoul, exc=exc, vj=vj, vk=vk)
+        return vxc
+
+    def energy_elec(ks, dm=None, h1e=None, vhf=None):
+        if dm is None: dm = ks.make_rdm1()
+        if h1e is None: h1e = ks.get_hcore()
+        if vhf is None or getattr(vhf, 'ecoul', None) is None:
+            vhf = ks.get_veff(ks.mol, dm)
+        if not (isinstance(dm, cupy.ndarray) and dm.ndim == 2):
+            dm = dm[0] + dm[1]
+        return rks.energy_elec(ks, dm, h1e, vhf)
+
+else:
+    def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+        '''Coulomb + XC functional for UKS (CPU fallback).'''
+        if mol is None: mol = ks.mol
+        if dm is None: dm = ks.make_rdm1()
+        dm = np.asarray(dm)
+        if dm.ndim == 2:
+            dm = np.asarray((dm*.5, dm*.5))
+        assert dm.ndim == 3
+        t0 = logger.init_timer(ks)
         rks.initialize_grids(ks, mol, dm[0]+dm[1])
 
-    ground_state = getattr(dm, 'ndim', 0) == 3
+        ground_state = dm.ndim == 3
+        ni = ks._numint
+        if hermi == 2:
+            n, exc, vxc = (0,0), 0, np.zeros_like(dm)
+        else:
+            n, exc, vxc = ni.nr_uks(mol, ks.grids, ks.xc, dm)
+            logger.debug(ks, 'nelec by numeric integration = %s', n)
+            if ks.do_nlc():
+                if ni.libxc.is_nlc(ks.xc):
+                    xc = ks.xc
+                else:
+                    assert ni.libxc.is_nlc(ks.nlc)
+                    xc = ks.nlc
+                n, enlc, vnlc = ni.nr_nlc_vxc(mol, ks.nlcgrids, xc, dm)
+                exc += enlc
+                vxc += vnlc
+            t0 = logger.timer(ks, 'vxc', *t0)
 
-    ni = ks._numint
-    if hermi == 2:  # because rho = 0
-        n, exc, vxc = (0,0), 0, 0
-    else:
-        max_memory = ks.max_memory - lib.current_memory()[0]
-        n, exc, vxc = ni.nr_uks(mol, ks.grids, ks.xc, dm.view(cupy.ndarray), max_memory=max_memory)
-        logger.debug(ks, 'nelec by numeric integration = %s', n)
-        if ks.do_nlc():
-            if ni.libxc.is_nlc(ks.xc):
-                xc = ks.xc
-            else:
-                assert ni.libxc.is_nlc(ks.nlc)
-                xc = ks.nlc
-            n, enlc, vnlc = ni.nr_nlc_vxc(mol, ks.nlcgrids, xc, dm)
-            exc += enlc
-            vxc += vnlc
-            logger.debug(ks, 'nelec with nlc grids = %s', n)
-        t0 = logger.timer(ks, 'vxc', *t0)
-
-    dm_orig = dm
-    vj_last = getattr(vhf_last, 'vj', None)
-    if vj_last is not None:
-        dm = asarray(dm) - asarray(dm_last)
-    vj = ks.get_j(mol, dm[0]+dm[1], hermi)
-    if vj_last is not None:
-        vj += asarray(vj_last)
-    vxc += vj
-    if ground_state:
-        ecoul = float(cupy.einsum('nij,ij->', dm_orig, vj).real) * .5
-    else:
-        ecoul = None
-
-    vk = None
-    if ni.libxc.is_hybrid_xc(ks.xc):
-        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
-        if omega == 0:
-            vk = ks.get_k(mol, dm, hermi)
-            vk *= hyb
-        elif alpha == 0: # LR=0, only SR exchange
-            vk = ks.get_k(mol, dm, hermi, omega=-omega)
-            vk *= hyb
-        elif hyb == 0: # SR=0, only LR exchange
-            vk = ks.get_k(mol, dm, hermi, omega=omega)
-            vk *= alpha
-        else: # SR and LR exchange with different ratios
-            vk = ks.get_k(mol, dm, hermi)
-            vk *= hyb
-            vklr = ks.get_k(mol, dm, hermi, omega=omega)
-            vklr *= (alpha - hyb)
-            vk += vklr
+        dm_orig = dm
+        vj_last = getattr(vhf_last, 'vj', None)
         if vj_last is not None:
-            vk += asarray(vhf_last.vk)
-        vxc -= vk
+            dm = np.asarray(dm) - np.asarray(dm_last)
+        vj = ks.get_j(mol, dm[0]+dm[1], hermi)
+        vj = np.asarray(vj)
+        if vj_last is not None:
+            vj = vj + np.asarray(vj_last)
+        vxc = np.asarray(vxc) + vj
         if ground_state:
-            exc -= float(cupy.einsum('nij,nij', dm_orig, vk).real) * .5
-    t0 = logger.timer(ks, 'veff', *t0)
-    vxc = tag_array(vxc, ecoul=ecoul, exc=exc, vj=vj, vk=vk)
-    return vxc
+            ecoul = float(np.einsum('nij,ij->', dm_orig, vj).real) * .5
+        else:
+            ecoul = None
 
+        vk = None
+        if ni.libxc.is_hybrid_xc(ks.xc):
+            omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
+            if omega == 0:
+                vk = np.asarray(ks.get_k(mol, dm, hermi)) * hyb
+            elif alpha == 0:
+                vk = np.asarray(ks.get_k(mol, dm, hermi, omega=-omega)) * hyb
+            elif hyb == 0:
+                vk = np.asarray(ks.get_k(mol, dm, hermi, omega=omega)) * alpha
+            else:
+                vk = np.asarray(ks.get_k(mol, dm, hermi)) * hyb
+                vklr = np.asarray(ks.get_k(mol, dm, hermi, omega=omega))
+                vk += vklr * (alpha - hyb)
+            if vj_last is not None:
+                vk = vk + np.asarray(vhf_last.vk)
+            vxc = vxc - vk
+            if ground_state:
+                exc -= float(np.einsum('nij,nij', dm_orig, vk).real) * .5
+        t0 = logger.timer(ks, 'veff', *t0)
+        vxc = tag_array(vxc, ecoul=ecoul, exc=exc, vj=vj, vk=vk)
+        return vxc
 
-def energy_elec(ks, dm=None, h1e=None, vhf=None):
-    if dm is None: dm = ks.make_rdm1()
-    if h1e is None: h1e = ks.get_hcore()
-    if vhf is None or getattr(vhf, 'ecoul', None) is None:
-        vhf = ks.get_veff(ks.mol, dm)
-    if not (isinstance(dm, cupy.ndarray) and dm.ndim == 2):
-        dm = dm[0] + dm[1]
-    return rks.energy_elec(ks, dm, h1e, vhf)
+    def energy_elec(ks, dm=None, h1e=None, vhf=None):
+        if dm is None: dm = ks.make_rdm1()
+        if h1e is None: h1e = ks.get_hcore()
+        if vhf is None or getattr(vhf, 'ecoul', None) is None:
+            vhf = ks.get_veff(ks.mol, dm)
+        dm = np.asarray(dm)
+        if not (dm.ndim == 2):
+            dm = dm[0] + dm[1]
+        return rks.energy_elec(ks, dm, h1e, vhf)
 
 
 class UKS(rks.KohnShamDFT, uhf.UHF):
@@ -122,8 +198,8 @@ class UKS(rks.KohnShamDFT, uhf.UHF):
     to_hf = NotImplemented
 
     def Gradients(self):
-        from gpu4pyscf.grad import uks as uks_grad
-        return uks_grad.Gradients(self)
+        from gpu4pyscf.grad import UKS as UKSGrad
+        return UKSGrad(self)
 
     to_gpu = utils.to_gpu
     device = utils.device

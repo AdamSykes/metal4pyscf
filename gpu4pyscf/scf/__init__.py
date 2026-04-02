@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from gpu4pyscf.lib.backends import BACKEND_NAME
+
 from . import hf
 from .hf import RHF
-from .hf_lowmem import RHF as LRHF
+from . import uhf
 from .uhf import UHF
-from .ghf import GHF
-from .rohf import ROHF
-from . import dispersion
+
+if BACKEND_NAME == 'cupy':
+    from .hf_lowmem import RHF as LRHF
+    from .ghf import GHF
+    from .rohf import ROHF
+    from . import dispersion
 
 def HF(mol, *args):
     if mol.nelectron == 1 or mol.spin == 0:

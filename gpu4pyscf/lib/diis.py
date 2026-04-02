@@ -22,10 +22,10 @@ DIIS
 
 import sys
 import numpy as np
-import cupy
 from pyscf.lib import logger
 from pyscf.lib import misc
 from pyscf import __config__
+from gpu4pyscf.lib.backend import xp, to_host, to_device, is_device_array
 
 # PCCP, 4, 11 (2002); DOI:10.1039/B108658H
 # GEDIIS, JCTC, 2, 835 (2006); DOI:10.1021/ct050275a
@@ -123,8 +123,8 @@ class DIIS(object):
         self._err_vec_touched = False
 
     def _store(self, key, value):
-        if not self.incore and isinstance(value, cupy.ndarray):
-            value = value.get()
+        if not self.incore and is_device_array(value):
+            value = to_host(value)
         self._buffer[key] = value
 
     def push_err_vec(self, xerr):
@@ -202,18 +202,18 @@ class DIIS(object):
             self._H[0,1:] = self._H[1:,0] = 1
         for i in range(nd):
             dti = self.get_err_vec(i)
-            tmp = cupy.asnumpy(dt.conj().dot(dti))
+            tmp = to_host(dt.conj().dot(dti)) if is_device_array(dt) else dt.conj().dot(dti)
             self._H[self._head,i+1] = tmp
             self._H[i+1,self._head] = tmp.conjugate()
         dt = None
 
         if self._xprev is None:
-            xnew = cupy.asarray(self.extrapolate(nd))
+            xnew = to_device(self.extrapolate(nd))
         else:
             self._xprev = None # release memory first
             xnew = self.extrapolate(nd)
             self._store('xprev', xnew)
-            self._xprev = xnew = cupy.asarray(xnew)
+            self._xprev = xnew = to_device(xnew)
         return xnew.reshape(x.shape)
 
     def extrapolate(self, nd=None):

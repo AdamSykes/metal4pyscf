@@ -14,8 +14,11 @@
 
 import sys
 import time
-import cupy
 from pyscf import lib
+from gpu4pyscf.lib.backends import BACKEND_NAME
+
+if BACKEND_NAME == 'cupy':
+    import cupy
 
 INFO = lib.logger.INFO
 NOTE = lib.logger.NOTE
@@ -30,21 +33,36 @@ process_clock = time.process_time
 perf_counter = time.perf_counter
 
 
+def _gpu_event():
+    """Create a GPU timing event (CuPy) or a wall-clock timestamp (other backends)."""
+    if BACKEND_NAME == 'cupy':
+        e = cupy.cuda.Event()
+        e.record()
+        return e
+    return perf_counter()
+
+def _gpu_elapsed(e0, e1):
+    """Elapsed GPU time in ms between two events."""
+    if BACKEND_NAME == 'cupy':
+        e1.synchronize()
+        return cupy.cuda.get_elapsed_time(e0, e1)
+    # Fallback: wall-clock difference in ms
+    return (e1 - e0) * 1000.0
+
+
 def init_timer(rec):
-    e0 = cupy.cuda.Event()
-    e0.record()
+    e0 = _gpu_event()
     wall = perf_counter()
     return (process_clock(), wall, e0)
 
 def timer(rec, msg, cpu0=None, wall0=None, gpu0=None):
     timer_level = getattr(rec, 'TIMER_LEVEL', TIMER_LEVEL)
     if gpu0:
-        t0, w0, e0 = process_clock(), perf_counter(), cupy.cuda.Event()
-        e0.record()
+        t0, w0, e0 = process_clock(), perf_counter(), _gpu_event()
         if rec.verbose >= timer_level:
-            e0.synchronize()
+            gpu_ms = _gpu_elapsed(gpu0, e0)
             flush(rec, '    CPU time for %-50s %9.2f sec, wall time %9.2f sec, GPU time %9.2f ms'
-                  % (msg, t0-cpu0, w0-wall0, cupy.cuda.get_elapsed_time(gpu0,e0)))
+                  % (msg, t0-cpu0, w0-wall0, gpu_ms))
         return t0, w0, e0
     elif wall0:
         t0, w0 = process_clock(), perf_counter()
@@ -60,10 +78,9 @@ def timer(rec, msg, cpu0=None, wall0=None, gpu0=None):
 
 def timer_silent(rec, cpu0=None, wall0=None, gpu0=None):
     if gpu0:
-        t0, w0, e0 = process_clock(), perf_counter(), cupy.cuda.Event()
-        e0.record()
-        e0.synchronize()
-        return t0-cpu0, w0-wall0, cupy.cuda.get_elapsed_time(gpu0,e0)
+        t0, w0, e0 = process_clock(), perf_counter(), _gpu_event()
+        gpu_ms = _gpu_elapsed(gpu0, e0)
+        return t0-cpu0, w0-wall0, gpu_ms
     elif wall0:
         t0, w0 = process_clock(), perf_counter()
         return t0-cpu0, w0-wall0
@@ -76,8 +93,7 @@ def _timer_debug1(rec, msg, cpu0=None, wall0=None, gpu0=None, sync=True):
     if rec.verbose >= DEBUG1:
         return timer(rec, msg, cpu0, wall0, gpu0)
     elif gpu0:
-        t0, w0, e0 = process_clock(), perf_counter(), cupy.cuda.Event()
-        e0.record()
+        t0, w0, e0 = process_clock(), perf_counter(), _gpu_event()
         return t0, w0, e0
     elif wall0:
         t0, w0 = process_clock(), perf_counter()
@@ -90,8 +106,7 @@ def _timer_debug2(rec, msg, cpu0=None, wall0=None, gpu0=None, sync=True):
     if rec.verbose >= DEBUG2:
         return timer(rec, msg, cpu0, wall0, gpu0)
     elif gpu0:
-        t0, w0, e0 = process_clock(), perf_counter(), cupy.cuda.Event()
-        e0.record()
+        t0, w0, e0 = process_clock(), perf_counter(), _gpu_event()
         return t0, w0, e0
     elif wall0:
         t0, w0 = process_clock(), perf_counter()
@@ -101,15 +116,11 @@ def _timer_debug2(rec, msg, cpu0=None, wall0=None, gpu0=None, sync=True):
         return t0,
 
 def print_mem_info(rec):
-    mempool = cupy.get_default_memory_pool()
-    used_mem = mempool.used_bytes()
-    free_mem = mempool.free_bytes()
-    free_blocks = mempool.n_free_blocks()
-    mem_avail = cupy.cuda.runtime.memGetInfo()[0]
-    flush(rec, f'mem_info: unallocated={mem_avail/1024**2:.2f} MB, '
-          f'used={used_mem/1024**2:.2f} MB, free={free_mem/1024**2:.2f} MB, '
-          f'free_blocks={free_blocks}')
-    return mem_avail + free_mem
+    from gpu4pyscf.lib.backend import memory
+    free, total = memory.get_mem_info()
+    used = memory.get_pool_used()
+    flush(rec, f'mem_info: free={free/1024**2:.2f} MB, used={used/1024**2:.2f} MB')
+    return free
 
 info = lib.logger.info
 note = lib.logger.note

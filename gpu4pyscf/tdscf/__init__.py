@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from gpu4pyscf.lib.backends import BACKEND_NAME
 
-from gpu4pyscf.tdscf import rhf
-from gpu4pyscf.tdscf import uhf
-from gpu4pyscf.tdscf import rks
-from gpu4pyscf.tdscf import uks
+if BACKEND_NAME == 'cupy':
+    from gpu4pyscf.tdscf import rhf, uhf, rks, uks

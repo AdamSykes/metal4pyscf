@@ -1,10 +1,17 @@
+from gpu4pyscf.lib.backends import BACKEND_NAME
+
 from . import rks
 from .rks import RKS, KohnShamDFT
-from .rks_lowmem import RKS as LRKS
+
 from .uks import UKS
-from .gks import GKS
-from .roks import ROKS
-from .gen_grid import Grids
+
+if BACKEND_NAME == 'cupy':
+    from .rks_lowmem import RKS as LRKS
+    from .gks import GKS
+    from .roks import ROKS
+    from .gen_grid import Grids
+else:
+    from pyscf.dft.gen_grid import Grids
 
 def KS(mol, xc='LDA,VWN'):
     if mol.spin == 0:

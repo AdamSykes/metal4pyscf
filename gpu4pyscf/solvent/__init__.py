@@ -12,46 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from gpu4pyscf.solvent import pcm, smd
+from gpu4pyscf.lib.backends import BACKEND_NAME
 
-def PCM(method_or_mol, solvent_obj=None, dm=None):
-    '''Initialize PCM model.
+if BACKEND_NAME == 'cupy':
+    from gpu4pyscf.solvent import pcm, smd
 
-    Examples:
+    def PCM(method_or_mol, solvent_obj=None, dm=None):
+        from pyscf import gto
+        from gpu4pyscf import scf
+        if isinstance(method_or_mol, gto.mole.Mole):
+            return pcm.PCM(method_or_mol)
+        elif isinstance(method_or_mol, scf.hf.SCF):
+            return pcm.pcm_for_scf(method_or_mol, solvent_obj, dm)
+        else:
+            raise NotImplementedError(f'PCM model does not support {method_or_mol}')
 
-    >>> mf = PCM(scf.RHF(mol))
-    >>> mf.kernel()
-    >>> sol = PCM(mol)
-    >>> mc = PCM(CASCI(mf, 6, 6), sol)
-    >>> mc.kernel()
-    '''
-    from pyscf import gto
-    from gpu4pyscf import scf
+    def SMD(method_or_mol, solvent_obj=None, dm=None, solvent='water'):
+        from pyscf import gto
+        from gpu4pyscf import scf
+        if isinstance(method_or_mol, gto.mole.Mole):
+            return smd.SMD(method_or_mol, solvent=solvent)
+        elif isinstance(method_or_mol, scf.hf.SCF):
+            return smd.smd_for_scf(method_or_mol, solvent_obj, dm)
+        else:
+            raise NotImplementedError(f'SMD model does not support {method_or_mol}')
+else:
+    def PCM(method_or_mol, solvent_obj=None, dm=None):
+        """Apply PCM solvent model via PySCF CPU."""
+        from pyscf import gto
+        if isinstance(method_or_mol, gto.mole.Mole):
+            from pyscf.solvent.pcm import PCM as _PCM
+            return _PCM(method_or_mol)
+        # Convert to CPU if needed, apply PCM
+        if hasattr(method_or_mol, 'to_cpu'):
+            mf_cpu = method_or_mol.to_cpu()
+        else:
+            mf_cpu = method_or_mol
+        return mf_cpu.PCM(solvent_obj, dm)
 
-    if isinstance(method_or_mol, gto.mole.Mole):
-        return pcm.PCM(method_or_mol)
-    elif isinstance(method_or_mol, scf.hf.SCF):
-        return pcm.pcm_for_scf(method_or_mol, solvent_obj, dm)
-    else:
-        raise NotImplementedError(f'PCM model does not support {method_or_mol}')
-
-def SMD(method_or_mol, solvent_obj=None, dm=None, solvent='water'):
-    '''Initialize SMD model.
-
-    Examples:
-
-    >>> mf = PCM(scf.RHF(mol))
-    >>> mf.kernel()
-    >>> sol = PCM(mol)
-    >>> mc = PCM(CASCI(mf, 6, 6), sol)
-    >>> mc.kernel()
-    '''
-    from pyscf import gto
-    from gpu4pyscf import scf
-
-    if isinstance(method_or_mol, gto.mole.Mole):
-        return smd.SMD(method_or_mol, solvent=solvent)
-    elif isinstance(method_or_mol, scf.hf.SCF):
-        return smd.smd_for_scf(method_or_mol, solvent_obj, dm)
-    else:
-        raise NotImplementedError(f'SMD model does not support {method_or_mol}')
+    def SMD(method_or_mol, solvent_obj=None, dm=None, solvent='water'):
+        """Apply SMD solvent model via PySCF CPU."""
+        from pyscf import gto
+        if isinstance(method_or_mol, gto.mole.Mole):
+            from pyscf.solvent.smd import SMD as _SMD
+            return _SMD(method_or_mol, solvent=solvent)
+        if hasattr(method_or_mol, 'to_cpu'):
+            mf_cpu = method_or_mol.to_cpu()
+        else:
+            mf_cpu = method_or_mol
+        return mf_cpu.SMD(solvent_obj, dm)

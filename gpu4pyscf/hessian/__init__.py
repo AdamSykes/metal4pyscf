@@ -11,11 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Author: Qiming Sun <osirpt.sun@gmail.com>
-#  modified by Xiaojie Wu <wxj6000@gmail.com>
 
-from gpu4pyscf.hessian import rhf, uhf
-from gpu4pyscf.hessian.rhf import Hessian as RHF
-from gpu4pyscf.hessian import rks, uks
-from gpu4pyscf.hessian import dispersion
+from gpu4pyscf.lib.backends import BACKEND_NAME
+
+if BACKEND_NAME == 'cupy':
+    from gpu4pyscf.hessian import rhf, uhf
+    from gpu4pyscf.hessian.rhf import Hessian as RHF
+    from gpu4pyscf.hessian import rks, uks
+    from gpu4pyscf.hessian import dispersion
+else:
+    from gpu4pyscf.hessian._cpu_fallback import (
+        RHFHessian as RHF,
+        RKSHessian as RKS,
+        UHFHessian as UHF,
+        UKSHessian as UKS,
+    )
