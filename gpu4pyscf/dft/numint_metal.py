@@ -40,12 +40,10 @@ def nr_rks_metal(ni, mol, grids, xc_code, dm, hermi=1, max_memory=2000):
     shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping = \
         _prepare_shell_data(mol)
 
-    # Batch size: control GPU memory usage
-    # For GGA deriv=1: 4 * ncart * batch * 4 bytes
-    max_gpu_bytes = max_memory * 1024 * 1024
-    ncomp = 4 if ao_deriv == 1 else 1
-    bytes_per_grid = ncomp * ncart_total * 4 + nao * 4  # ao + rho scratch
-    batch_size = max(1000, min(ngrids_total, int(max_gpu_bytes / bytes_per_grid)))
+    # Batch size: ~20K grid points is optimal for GPU cache utilization.
+    # Smaller batches avoid large output allocations (4*ncart*batch*4 bytes)
+    # that exceed the GPU's effective cache. 20K gives ~50-200 MB per batch.
+    batch_size = 20000
 
     coords_np = np.asarray(grids.coords)
     weights_np = np.asarray(grids.weights)
