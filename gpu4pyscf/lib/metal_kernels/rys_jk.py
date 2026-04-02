@@ -16,6 +16,7 @@ minimal basis sets. Extension to d/f follows the same TRR/HRR pattern.
 import numpy as np
 import mlx.core as mx
 from math import sqrt, pi, erf, exp
+from gpu4pyscf.lib.metal_kernels.eval_ao import _ncart, _cart2sph_matrix
 
 
 # ---------------------------------------------------------------------------
@@ -157,10 +158,10 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
 
     for ish in range(nbas):
         li = mol.bas_angular(ish)
-        if li > 1:
-            continue
+        if li > 3:
+            continue  # support up to f-shells
         i0, i1 = ao_loc[ish], ao_loc[ish + 1]
-        ni = i1 - i0
+        ni = _ncart(li)
         Ri = mol.atom_coord(mol.bas_atom(ish))
         ai_list = mol.bas_exp(ish)
         ci_list = mol._libcint_ctr_coeff(ish).flatten()
@@ -170,7 +171,7 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
             if lj > 1:
                 continue
             j0, j1 = ao_loc[jsh], ao_loc[jsh + 1]
-            nj = j1 - j0
+            nj = _ncart(lj)
             Rj = mol.atom_coord(mol.bas_atom(jsh))
             aj_list = mol.bas_exp(jsh)
             cj_list = mol._libcint_ctr_coeff(jsh).flatten()
@@ -180,7 +181,7 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
                 if lk > 1:
                     continue
                 k0, k1 = ao_loc[ksh], ao_loc[ksh + 1]
-                nk = k1 - k0
+                nk = _ncart(lk)
                 Rk = mol.atom_coord(mol.bas_atom(ksh))
                 ak_list = mol.bas_exp(ksh)
                 ck_list = mol._libcint_ctr_coeff(ksh).flatten()
@@ -190,7 +191,7 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
                     if ll > 1:
                         continue
                     l0, l1 = ao_loc[lsh], ao_loc[lsh + 1]
-                    nl = l1 - l0
+                    nl = _ncart(ll)
                     Rl = mol.atom_coord(mol.bas_atom(lsh))
                     al_list = mol.bas_exp(lsh)
                     cl_list = mol._libcint_ctr_coeff(lsh).flatten()
@@ -242,7 +243,15 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
                                         Ri, Rj, Rk, Rl, Pij, Pkl,
                                         li, lj, lk, ll, nroots)
 
-                    # Accumulate J and K
+                    # Cart → spherical transformation
+                    if not mol.cart:
+                        for idx, lv in enumerate([li, lj, lk, ll]):
+                            if lv >= 2:
+                                c2s = _cart2sph_matrix(lv)
+                                eri = np.tensordot(c2s.T, eri, axes=([1],[idx]))
+                                eri = np.moveaxis(eri, 0, idx)
+
+                    # Accumulate J and K (using spherical ao_loc indices)
                     if with_j:
                         vj[i0:i1, j0:j1] += np.einsum('kl,ijkl->ij', dm[k0:k1, l0:l1], eri)
                     if with_k:
@@ -270,8 +279,13 @@ def _rys_build_eri(eri, prefac, fm, ai, aj, ak, al, aij, akl,
 
     roots, weights = _rys_from_boys(nroots, fm)
 
-    cart_idx = {0: [(0, 0, 0)],
-                1: [(1, 0, 0), (0, 1, 0), (0, 0, 1)]}
+    cart_idx = {
+        0: [(0,0,0)],
+        1: [(1,0,0),(0,1,0),(0,0,1)],
+        2: [(2,0,0),(1,1,0),(1,0,1),(0,2,0),(0,1,1),(0,0,2)],
+        3: [(3,0,0),(2,1,0),(2,0,1),(1,2,0),(1,1,1),(1,0,2),
+            (0,3,0),(0,2,1),(0,1,2),(0,0,3)],
+    }
 
     for iroot in range(nroots):
         rt = roots[iroot]
@@ -358,21 +372,24 @@ def _rys_from_boys(nroots, fm):
         w1 = (fm[1] - fm[0]*t0) / (t1-t0)
         w0 = fm[0] - w1
         return np.array([t0, t1]), np.array([w0, w1])
-    elif nroots == 3:
-        # 3x3 Hankel system: [F0,F1,F2; F1,F2,F3; F2,F3,F4] @ c = [F3,F4,F5]
-        A = np.array([[fm[0],fm[1],fm[2]],[fm[1],fm[2],fm[3]],[fm[2],fm[3],fm[4]]])
-        b = np.array([fm[3], fm[4], fm[5]])
-        try:
-            c = np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
-            t = fm[1]/fm[0] if fm[0] > 1e-30 else 0
-            return np.array([t,t,t]), np.array([fm[0]/3]*3)
-        # Roots of t^3 - c[2]*t^2 - c[1]*t - c[0] = 0
-        roots = np.roots([1, -c[2], -c[1], -c[0]])
-        roots = np.real(roots)
-        roots.sort()
-        # Weights from Vandermonde
-        V = np.vander(roots, increasing=True)[:, :nroots]
-        weights = np.linalg.solve(V.T, fm[:nroots])
-        return roots, weights
-    raise NotImplementedError(f"Rys roots for nroots={nroots}")
+    # General nroots >= 2 via Hankel matrix
+    n = nroots
+    H = np.array([[fm[i+j] for j in range(n)] for i in range(n)])
+    rhs = np.array([fm[n+i] for i in range(n)])
+    try:
+        c = np.linalg.solve(H, rhs)
+    except np.linalg.LinAlgError:
+        t = fm[1]/fm[0] if fm[0] > 1e-30 else 0
+        return np.full(n, t), np.full(n, fm[0]/n)
+    poly = np.zeros(n + 1)
+    poly[0] = 1.0
+    for i in range(n):
+        poly[n - i] = -c[i]
+    roots = np.real(np.roots(poly))
+    roots.sort()
+    V = np.vander(roots, increasing=True)[:, :n]
+    try:
+        weights = np.linalg.solve(V.T, fm[:n])
+    except np.linalg.LinAlgError:
+        weights = np.full(n, fm[0]/n)
+    return roots, weights
