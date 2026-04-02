@@ -37,10 +37,12 @@ class MetalDFTensors:
     """
 
     def __init__(self, dfobj):
+        from gpu4pyscf.lib.metal_kernels import unpack_tril as metal_unpack_tril
+
         nao = dfobj.mol.nao
         npairs = nao * (nao + 1) // 2
 
-        # Collect all CDERI blocks
+        # Collect all CDERI blocks, convert to f32, send to GPU once
         tril_blocks = [np.asarray(b, dtype=np.float32) for b in dfobj.loop()]
         cderi_tril_np = np.concatenate(tril_blocks, axis=0)
         naux = cderi_tril_np.shape[0]
@@ -48,9 +50,9 @@ class MetalDFTensors:
         # Store packed form on GPU for J
         self.cderi_tril_gpu = mx.array(cderi_tril_np)
 
-        # Unpack to full form on CPU (once), store on GPU for K
-        cderi_full_np = pyscf_lib.unpack_tril(cderi_tril_np)
-        self.cderi_full_gpu = mx.array(cderi_full_np)
+        # Unpack to full form entirely on GPU for K
+        self.cderi_full_gpu = metal_unpack_tril(self.cderi_tril_gpu, hermi=1)
+        mx.eval(self.cderi_full_gpu)
 
         self.nao = nao
         self.naux = naux

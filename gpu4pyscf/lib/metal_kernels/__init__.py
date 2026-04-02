@@ -150,24 +150,15 @@ if (i >= nao || j >= nao) return;
 uint stride = ((nao + 1) * nao) / 2;
 uint nao2 = nao * nao;
 
-// Only fill lower triangle and diagonal from packed data
-if (i >= j) {
-    uint ptr = i*(i+1)/2 + j;
-    for (uint p = 0; p < counts; ++p) {
-        out[p*nao2 + i*nao + j] = tril[ptr + p*stride];
-    }
-}
+// Read from tril for both triangles (no read-after-write hazard)
+uint row = (i >= j) ? i : j;  // max(i,j)
+uint col = (i >= j) ? j : i;  // min(i,j)
+uint ptr = row*(row+1)/2 + col;
 
-// Fill upper triangle from lower (hermitian symmetry)
-if (i < j) {
-    for (uint p = 0; p < counts; ++p) {
-        uint off = p * nao2;
-        if (hermi == 1) {
-            out[off + i*nao + j] = out[off + j*nao + i];
-        } else {
-            out[off + i*nao + j] = -out[off + j*nao + i];
-        }
-    }
+for (uint p = 0; p < counts; ++p) {
+    float val = tril[ptr + p*stride];
+    if (hermi == 2 && i < j) val = -val;
+    out[p*nao2 + i*nao + j] = val;
 }
 '''
 
@@ -183,19 +174,20 @@ def unpack_tril(tril, hermi=1):
     """Unpack compact lower triangular to full symmetric matrix on Metal GPU.
 
     Args:
-        tril: (counts, n*(n+1)/2) or (n*(n+1)/2,) packed lower triangle
+        tril: (counts, n*(n+1)/2) or (n*(n+1)/2,) packed lower triangle.
+              Can be numpy array or mx.array.
         hermi: 1 for symmetric, 2 for anti-symmetric
 
     Returns:
-        (counts, n, n) or (n, n) full matrix
+        (counts, n, n) or (n, n) full matrix (mx.array)
     """
-    tril = mx.array(np.asarray(tril, dtype=np.float32))
+    if not isinstance(tril, mx.array):
+        tril = mx.array(np.asarray(tril, dtype=np.float32))
     squeeze = tril.ndim == 1
     if squeeze:
         tril = tril.reshape(1, -1)
     counts = tril.shape[0]
     tril_size = tril.shape[1]
-    # Solve n*(n+1)/2 = tril_size for n
     nao = int((2 * tril_size) ** 0.5)
     assert nao * (nao + 1) // 2 == tril_size
 
@@ -203,9 +195,6 @@ def unpack_tril(tril, hermi=1):
     grid = (((nao + THREADS - 1) // THREADS) * THREADS,
             ((nao + THREADS - 1) // THREADS) * THREADS, 1)
     threadgroup = (THREADS, THREADS, 1)
-
-    # Two-pass: first unpack lower, then fill upper
-    # MLX kernels can't read-then-write the same output in one pass easily,
     # so we do this in a single pass with a barrier-like approach.
     # Actually, the lower triangle writes don't overlap with upper triangle reads,
     # so we need two passes.
