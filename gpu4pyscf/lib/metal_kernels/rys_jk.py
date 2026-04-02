@@ -224,7 +224,9 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
                                     rr_pq = np.dot(Rpq, Rpq)
 
                                     # Boys functions
-                                    fm = boys_function(li + lj + lk + ll, [theta * rr_pq])
+                                    # Need F_0 through F_{2*nroots-1} for Rys root extraction
+                                    m_max = max(li + lj + lk + ll, 2 * nroots - 1)
+                                    fm = boys_function(m_max, [theta * rr_pq])
 
                                     prefac = coeff * 2.0 * pi**2.5 / (aij * akl * sqrt(aij + akl))
                                     fac_i = fac_l.get(li, 1.0)
@@ -251,139 +253,126 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
 
 def _rys_build_eri(eri, prefac, fm, ai, aj, ak, al, aij, akl,
                    Ri, Rj, Rk, Rl, Pij, Pkl, li, lj, lk, ll, nroots):
-    """Build ERI tensor from Boys functions using Obara-Saika recurrence.
+    """Build ERI using Rys quadrature: factorized 1D per direction.
 
-    For (ss|ss): direct from F_0
-    For shells with l>0: uses vertical recurrence relation (VRR)
+    Each Rys root gives independent 1D recurrences that multiply across
+    x,y,z. This is the correct factorization matching the CUDA code.
     """
-    theta = aij * akl / (aij + akl)
     Rpq = Pij - Pkl
-
-    # Recurrence coefficients
-    oo2z = 0.5 / aij
-    oo2e = 0.5 / akl
-    oo2ze = 0.5 / (aij + akl)
-
     PA = Pij - Ri
-    PB = Pij - Rj
     QC = Pkl - Rk
-    QD = Pkl - Rl
-    WP = theta / aij * Rpq
-    WQ = -theta / akl * Rpq
-
-    ni, nj, nk, nl = eri.shape
-
-    if li + lj + lk + ll == 0:
-        # (ss|ss): simplest case
-        eri[0, 0, 0, 0] += prefac * fm[0]
-        return
-
-    # General case: VRR + HRR for s/p shells
-    # Build g[ix,jx,kx,lx] for each Cartesian direction x=0,1,2
-    # then combine: eri[I,J,K,L] = g_x[ix,jx,kx,lx] * g_y[iy,jy,ky,ly] * g_z[iz,jz,kz,lz]
+    ABx = Ri - Rj
+    CDx = Rk - Rl
 
     lij = li + lj
     lkl = lk + ll
-    lmax = lij + lkl
+    ni, nj, nk, nl = eri.shape
 
-    # For each Rys root
-    for n in range(nroots):
-        # Rys root and weight from Boys functions
-        # For nroots roots, we use the Rys quadrature relation
-        # For simplicity with nroots=1,2: use Boys directly
-        pass
+    roots, weights = _rys_from_boys(nroots, fm)
 
-    # For s/p shells, use direct Obara-Saika VRR on Boys functions
-    # This avoids the Rys root computation for small nroots
-
-    # VRR: compute (a0|c0) integrals, then HRR for b,d indices
-    # [a+1,0|c,0]_m = PA[x]*[a,0|c,0]_m + WP[x]*[a,0|c,0]_{m+1}
-    #                 + a/(2*aij) * ([a-1,0|c,0]_m - theta/aij*[a-1,0|c,0]_{m+1})
-    #                 + c/(2*(aij+akl)) * [a,0|c-1,0]_{m+1}
-
-    for ix in range(3):  # x, y, z components
-        # Build 1D integrals along direction ix
-        g = np.zeros((lij + 1, lkl + 1, lmax + 1))
-
-        # Base: g[0,0,m] = fm[m]
-        for m in range(lmax + 1):
-            g[0, 0, m] = fm[m]
-
-        # VRR upward in a (bra side)
-        for a in range(lij):
-            for m in range(lmax - a):
-                g[a + 1, 0, m] = PA[ix] * g[a, 0, m] + WP[ix] * g[a, 0, m + 1]
-                if a > 0:
-                    g[a + 1, 0, m] += a * oo2z * (g[a - 1, 0, m] -
-                                                    theta / aij * g[a - 1, 0, m + 1])
-
-        # VRR upward in c (ket side)
-        for c in range(lkl):
-            for a in range(lij + 1):
-                for m in range(lmax - a - c):
-                    g[a, c + 1, m] = QC[ix] * g[a, c, m] + WQ[ix] * g[a, c, m + 1]
-                    if c > 0:
-                        g[a, c + 1, m] += c * oo2e * (g[a, c - 1, m] -
-                                                        theta / akl * g[a, c - 1, m + 1])
-                    if a > 0:
-                        g[a, c + 1, m] += a * oo2ze * g[a - 1, c, m + 1]
-
-        # HRR: transfer from (a,0) to (i,j) and (c,0) to (k,l)
-        # [i,j+1|k,l] = [i+1,j|k,l] + AB[x]*[i,j|k,l]
-        # [i,j|k,l+1] = [i,j|k+1,l] + CD[x]*[i,j|k,l]
-        ABx = Ri[ix] - Rj[ix]
-        CDx = Rk[ix] - Rl[ix]
-
-        # Store 1D integrals: g1d[i_comp, j_comp, k_comp, l_comp]
-        # For s/p: indices 0 or 1 only
-        g_hrr = np.zeros((li + 1, lj + 1, lk + 1, ll + 1))
-
-        # First build (a, 0 | c, 0) → (i, j | c, 0) via HRR on j
-        g_ac = np.zeros((lij + 1, lkl + 1))
-        for a in range(lij + 1):
-            for c in range(lkl + 1):
-                g_ac[a, c] = g[a, c, 0]
-
-        # HRR j-index: [i,j+1|c] = [i+1,j|c] + AB*[i,j|c]
-        g_ijc = np.zeros((lij + 1, lj + 1, lkl + 1))
-        for c in range(lkl + 1):
-            for a in range(lij + 1):
-                g_ijc[a, 0, c] = g_ac[a, c]
-            for j in range(lj):
-                for i in range(li + 1):
-                    g_ijc[i, j + 1, c] = g_ijc[i + 1, j, c] + ABx * g_ijc[i, j, c]
-
-        # HRR l-index: [i,j|k,l+1] = [i,j|k+1,l] + CD*[i,j|k,l]
-        g_ijkl = np.zeros((li + 1, lj + 1, lkl + 1, ll + 1))
-        for i in range(li + 1):
-            for j in range(lj + 1):
-                for c in range(lkl + 1):
-                    g_ijkl[i, j, c, 0] = g_ijc[i, j, c]
-                for l in range(ll):
-                    for k in range(lk + 1):
-                        g_ijkl[i, j, k, l + 1] = g_ijkl[i, j, k + 1, l] + CDx * g_ijkl[i, j, k, l]
-        g_hrr = g_ijkl[:li+1, :lj+1, :lk+1, :ll+1]
-
-        # Combine 3D: for each combination of Cartesian components
-        # This is the tensor product across x,y,z
-        if ix == 0:
-            gx = g_hrr.copy()
-        elif ix == 1:
-            gy = g_hrr.copy()
-        else:
-            gz = g_hrr.copy()
-
-    # Combine x,y,z into full ERI
-    # For s-shells (l=0): only (0,0,0,0) component
-    # For p-shells (l=1): 3 components (x,y,z)
     cart_idx = {0: [(0, 0, 0)],
                 1: [(1, 0, 0), (0, 1, 0), (0, 0, 1)]}
 
-    for ii, (ix_i, iy_i, iz_i) in enumerate(cart_idx[li]):
-        for jj, (ix_j, iy_j, iz_j) in enumerate(cart_idx[lj]):
-            for kk, (ix_k, iy_k, iz_k) in enumerate(cart_idx[lk]):
-                for ll_idx, (ix_l, iy_l, iz_l) in enumerate(cart_idx[ll]):
-                    val = (gx[ix_i, ix_j, ix_k, ix_l] *
-                           gy[iy_i, iy_j, iy_k, iy_l] *
-                           gz[iz_i, iz_j, iz_k, iz_l])
-                    eri[ii, jj, kk, ll_idx] += prefac * val
+    for iroot in range(nroots):
+        rt = roots[iroot]
+        wt = weights[iroot]
+
+        rt_aa = rt / (aij + akl)
+        rt_aij = rt_aa * akl
+        rt_akl = rt_aa * aij
+        b10 = 0.5 / aij * (1 - rt_aij)
+        b01 = 0.5 / akl * (1 - rt_akl)
+        b00 = 0.5 * rt_aa
+
+        g1d = [None, None, None]
+        for ix in range(3):
+            c0 = PA[ix] - rt_aij * Rpq[ix]
+            cp = QC[ix] + rt_akl * Rpq[ix]
+
+            g = np.zeros((lij + 1, lkl + 1))
+            g[0, 0] = 1.0
+
+            for a in range(lij):
+                g[a + 1, 0] = c0 * g[a, 0]
+                if a > 0:
+                    g[a + 1, 0] += a * b10 * g[a - 1, 0]
+
+            for c in range(lkl):
+                for a in range(lij + 1):
+                    g[a, c + 1] = cp * g[a, c]
+                    if c > 0:
+                        g[a, c + 1] += c * b01 * g[a, c - 1]
+                    if a > 0:
+                        g[a, c + 1] += a * b00 * g[a - 1, c]
+
+            g_ijc = np.zeros((lij + 1, lj + 1, lkl + 1))
+            for a in range(lij + 1):
+                for c in range(lkl + 1):
+                    g_ijc[a, 0, c] = g[a, c]
+            for j in range(lj):
+                for c in range(lkl + 1):
+                    for i in range(li + 1):
+                        g_ijc[i, j + 1, c] = g_ijc[i + 1, j, c] + ABx[ix] * g_ijc[i, j, c]
+
+            g_full = np.zeros((li + 1, lj + 1, lkl + 1, ll + 1))
+            for i in range(li + 1):
+                for j in range(lj + 1):
+                    for c in range(lkl + 1):
+                        g_full[i, j, c, 0] = g_ijc[i, j, c]
+                    for l_idx in range(ll):
+                        for k in range(lk + 1):
+                            g_full[i, j, k, l_idx + 1] = (g_full[i, j, k + 1, l_idx] +
+                                                            CDx[ix] * g_full[i, j, k, l_idx])
+            g1d[ix] = g_full[:li+1, :lj+1, :lk+1, :ll+1]
+
+        for ii, (ix_i, iy_i, iz_i) in enumerate(cart_idx[li]):
+            for jj, (ix_j, iy_j, iz_j) in enumerate(cart_idx[lj]):
+                for kk, (ix_k, iy_k, iz_k) in enumerate(cart_idx[lk]):
+                    for ll_idx, (ix_l, iy_l, iz_l) in enumerate(cart_idx[ll]):
+                        val = (g1d[0][ix_i, ix_j, ix_k, ix_l] *
+                               g1d[1][iy_i, iy_j, iy_k, iy_l] *
+                               g1d[2][iz_i, iz_j, iz_k, iz_l])
+                        eri[ii, jj, kk, ll_idx] += prefac * wt * val
+
+
+def _rys_from_boys(nroots, fm):
+    """Compute Rys roots and weights from Boys functions via Hankel matrix."""
+    if nroots == 1:
+        F0, F1 = fm[0], fm[1]
+        if F0 > 1e-30:
+            return np.array([F1 / F0]), np.array([F0])
+        return np.array([0.0]), np.array([F0])
+    elif nroots == 2:
+        A = np.array([[fm[0], fm[1]], [fm[1], fm[2]]])
+        b = np.array([fm[2], fm[3]])
+        try:
+            c = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            t = fm[1]/fm[0] if fm[0] > 1e-30 else 0
+            return np.array([t, t]), np.array([fm[0]/2, fm[0]/2])
+        disc = max(c[1]**2 + 4*c[0], 0)
+        sq = np.sqrt(disc)
+        t0, t1 = (c[1]-sq)/2, (c[1]+sq)/2
+        if abs(t1-t0) < 1e-30:
+            return np.array([t0, t1]), np.array([fm[0]/2, fm[0]/2])
+        w1 = (fm[1] - fm[0]*t0) / (t1-t0)
+        w0 = fm[0] - w1
+        return np.array([t0, t1]), np.array([w0, w1])
+    elif nroots == 3:
+        # 3x3 Hankel system: [F0,F1,F2; F1,F2,F3; F2,F3,F4] @ c = [F3,F4,F5]
+        A = np.array([[fm[0],fm[1],fm[2]],[fm[1],fm[2],fm[3]],[fm[2],fm[3],fm[4]]])
+        b = np.array([fm[3], fm[4], fm[5]])
+        try:
+            c = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            t = fm[1]/fm[0] if fm[0] > 1e-30 else 0
+            return np.array([t,t,t]), np.array([fm[0]/3]*3)
+        # Roots of t^3 - c[2]*t^2 - c[1]*t - c[0] = 0
+        roots = np.roots([1, -c[2], -c[1], -c[0]])
+        roots = np.real(roots)
+        roots.sort()
+        # Weights from Vandermonde
+        V = np.vander(roots, increasing=True)[:, :nroots]
+        weights = np.linalg.solve(V.T, fm[:nroots])
+        return roots, weights
+    raise NotImplementedError(f"Rys roots for nroots={nroots}")
