@@ -173,10 +173,7 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
     nao = mol.nao
     max_l = max(mol.bas_angular(i) for i in range(mol.nbas))
 
-    # Fused threadgroup kernel disabled pending rho computation bug fix.
-    # The batched approach (3.6x XC speedup) is used for all cases.
-    # TODO: fix shared memory reduction in _fused_rho_kernel
-    use_fused_rho = False
+    use_fused_rho = (xctype == 'LDA' and max_l <= 1 and nao <= 1024)
 
     if not use_fused_rho:
         # Batched approach (existing, works for all cases)
@@ -203,10 +200,12 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
     while max_nao < nao:
         max_nao *= 2
 
+    # MLX grid = total threads, NOT threadgroup count.
+    # We need ngrids threadgroups of max_nao threads each.
     rho_gpu = _fused_rho_kernel(
         inputs=[gridx, gridy, gridz, exps_gpu, coeffs_gpu, shell_data_gpu,
                 dm_gpu, ao_to_shell_gpu, ao_to_start_gpu, c2s_gpu],
-        grid=(ngrids, 1, 1),
+        grid=(ngrids * max_nao, 1, 1),
         threadgroup=(max_nao, 1, 1),
         output_shapes=[(ngrids,)],
         output_dtypes=[mx.float32],
