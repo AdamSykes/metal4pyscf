@@ -41,5 +41,5 @@ exclude = ["*test*", "*examples*", "*docker*"]
 "gpu4pyscf.lib.metal_kernels" = ["*.py"]
 
 [tool.pytest.ini_options]
-testpaths = ["gpu4pyscf/lib/backends/tests"]
+testpaths = ["tests", "gpu4pyscf/lib/backends/tests"]
 addopts = "--import-mode=importlib"

@@ -173,17 +173,19 @@ def _patch_df_with_metal_jk(mf_df):
         return _original_hess()
     mf_df.Hessian = _refined_hessian
 
-    _original_tddft = mf_df.TDDFT
-    def _refined_tddft():
-        _refine_to_f64(mf_df)
-        return _original_tddft()
-    mf_df.TDDFT = _refined_tddft
+    if hasattr(mf_df, 'TDDFT'):
+        _original_tddft = mf_df.TDDFT
+        def _refined_tddft():
+            _refine_to_f64(mf_df)
+            return _original_tddft()
+        mf_df.TDDFT = _refined_tddft
 
-    _original_tda = mf_df.TDA
-    def _refined_tda():
-        _refine_to_f64(mf_df)
-        return _original_tda()
-    mf_df.TDA = _refined_tda
+    if hasattr(mf_df, 'TDA'):
+        _original_tda = mf_df.TDA
+        def _refined_tda():
+            _refine_to_f64(mf_df)
+            return _original_tda()
+        mf_df.TDA = _refined_tda
 
 def _refine_to_f64(mf):
     """Refine f32-converged SCF to f64 before gradient computation.
