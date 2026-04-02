@@ -132,6 +132,124 @@ _fused_rho_kernel = mx.fast.metal_kernel(
 )
 
 
+# ---------------------------------------------------------------------------
+# Fused GGA rho kernel: computes rho[0] (density) + rho[1:4] (gradient)
+# Uses 4 shared arrays: ao_val, ao_dx, ao_dy, ao_dz
+# Total shared memory: 4 * MAX_NAO * 4 + MAX_NAO * 4 = 5 * MAX_NAO * 4 bytes
+# For 574 AOs (padded to 1024): 5 * 1024 * 4 = 20 KB — fits in 32 KB
+# ---------------------------------------------------------------------------
+
+_FUSED_RHO_GGA_SOURCE = '''
+uint gid = threadgroup_position_in_grid.x;
+uint tid = thread_position_in_threadgroup.x;
+if (gid >= ngrids) return;
+
+threadgroup float sh_ao[MAX_NAO];
+threadgroup float sh_dx[MAX_NAO];
+threadgroup float sh_dy[MAX_NAO];
+threadgroup float sh_dz[MAX_NAO];
+threadgroup float sh_red[MAX_NAO];
+
+// --- Step 1: compute ao value and derivatives for this thread's AO ---
+float ao_v = 0.0f, ao_x = 0.0f, ao_y = 0.0f, ao_z = 0.0f;
+
+if (tid < nao) {
+    int shell_id = ao_to_shell[tid];
+    int ao_start_v = ao_to_start[tid];
+    int local_ao = tid - ao_start_v;
+
+    float acx = shell_data[shell_id * 8 + 0];
+    float acy = shell_data[shell_id * 8 + 1];
+    float acz = shell_data[shell_id * 8 + 2];
+    float fac = shell_data[shell_id * 8 + 3];
+    int nprim = (int)shell_data[shell_id * 8 + 4];
+    int exp_off = (int)shell_data[shell_id * 8 + 6];
+    int ang = (int)shell_data[shell_id * 8 + 7];
+
+    float rx = gridx[gid] - acx;
+    float ry = gridy[gid] - acy;
+    float rz = gridz[gid] - acz;
+    float rr = rx*rx + ry*ry + rz*rz;
+
+    float ce = 0.0f, ce_2a = 0.0f;
+    for (int p = 0; p < nprim; p++) {
+        float c = coeffs[exp_off + p];
+        float a = exps[exp_off + p];
+        float e = exp(-a * rr);
+        ce += c * e;
+        ce_2a += c * e * a;
+    }
+    ce *= fac;
+    ce_2a *= -2.0f * fac;
+
+    if (ang == 0) {
+        ao_v = ce;
+        ao_x = ce_2a * rx;
+        ao_y = ce_2a * ry;
+        ao_z = ce_2a * rz;
+    }
+    else if (ang == 1) {
+        float r[3] = {rx, ry, rz};
+        float ar[3] = {ce_2a * rx, ce_2a * ry, ce_2a * rz};
+        ao_v = ce * r[local_ao];
+        // d/dx(ce * r[k]) = ce_2a*rx*r[k] + ce*delta(k,0)
+        ao_x = ar[0] * r[local_ao] + ((local_ao == 0) ? ce : 0.0f);
+        ao_y = ar[1] * r[local_ao] + ((local_ao == 1) ? ce : 0.0f);
+        ao_z = ar[2] * r[local_ao] + ((local_ao == 2) ? ce : 0.0f);
+    }
+
+    ao_v *= c2s_coeffs[tid];
+    ao_x *= c2s_coeffs[tid];
+    ao_y *= c2s_coeffs[tid];
+    ao_z *= c2s_coeffs[tid];
+}
+
+sh_ao[tid] = ao_v;
+sh_dx[tid] = ao_x;
+sh_dy[tid] = ao_y;
+sh_dz[tid] = ao_z;
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// --- Step 2: tmp[i] = sum_j dm[i,j] * ao[j] ---
+float tmp = 0.0f;
+if (tid < nao) {
+    for (uint j = 0; j < nao; j++) {
+        tmp += dm[tid * nao + j] * sh_ao[j];
+    }
+}
+
+// --- Step 3: reduce for rho[0] = sum_i ao[i]*tmp[i] ---
+sh_red[tid] = (tid < nao) ? (ao_v * tmp) : 0.0f;
+float rho0 = threadgroup_reduce_sum(sh_red, tid, MAX_NAO);
+
+// --- Step 4: reduce for nabla rho = 2 * sum_i dao/dr[i] * tmp[i] ---
+sh_red[tid] = (tid < nao) ? (ao_x * tmp) : 0.0f;
+float rhox = 2.0f * threadgroup_reduce_sum(sh_red, tid, MAX_NAO);
+
+sh_red[tid] = (tid < nao) ? (ao_y * tmp) : 0.0f;
+float rhoy = 2.0f * threadgroup_reduce_sum(sh_red, tid, MAX_NAO);
+
+sh_red[tid] = (tid < nao) ? (ao_z * tmp) : 0.0f;
+float rhoz = 2.0f * threadgroup_reduce_sum(sh_red, tid, MAX_NAO);
+
+if (tid == 0) {
+    rho_out[gid * 4 + 0] = rho0;
+    rho_out[gid * 4 + 1] = rhox;
+    rho_out[gid * 4 + 2] = rhoy;
+    rho_out[gid * 4 + 3] = rhoz;
+}
+'''
+
+_fused_rho_gga_kernel = mx.fast.metal_kernel(
+    name='fused_rho_gga',
+    input_names=['gridx', 'gridy', 'gridz', 'exps', 'coeffs', 'shell_data',
+                 'dm', 'ao_to_shell', 'ao_to_start', 'c2s_coeffs'],
+    output_names=['rho_out'],
+    header=_FUSED_RHO_HEADER,
+    source=_FUSED_RHO_GGA_SOURCE,
+)
+
+
 def _build_ao_mapping(mol):
     """Build AO-to-shell mapping and cart2sph coefficients for fused kernel.
 
@@ -173,7 +291,7 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
     nao = mol.nao
     max_l = max(mol.bas_angular(i) for i in range(mol.nbas))
 
-    use_fused_rho = (xctype == 'LDA' and max_l <= 1 and nao <= 1024)
+    use_fused_rho = (xctype in ('LDA', 'GGA') and max_l <= 1 and nao <= 1024)
 
     if not use_fused_rho:
         # Batched approach (existing, works for all cases)
@@ -201,39 +319,69 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
         max_nao *= 2
 
     # MLX grid = total threads, NOT threadgroup count.
-    # We need ngrids threadgroups of max_nao threads each.
-    rho_gpu = _fused_rho_kernel(
-        inputs=[gridx, gridy, gridz, exps_gpu, coeffs_gpu, shell_data_gpu,
-                dm_gpu, ao_to_shell_gpu, ao_to_start_gpu, c2s_gpu],
-        grid=(ngrids * max_nao, 1, 1),
-        threadgroup=(max_nao, 1, 1),
-        output_shapes=[(ngrids,)],
-        output_dtypes=[mx.float32],
-        template=[('ngrids', ngrids), ('nao', nao), ('MAX_NAO', max_nao)],
-    )
-    mx.eval(rho_gpu[0])
-    rho = np.array(rho_gpu[0], dtype=np.float64)
+    kernel_inputs = [gridx, gridy, gridz, exps_gpu, coeffs_gpu, shell_data_gpu,
+                     dm_gpu, ao_to_shell_gpu, ao_to_start_gpu, c2s_gpu]
+    kernel_template = [('ngrids', ngrids), ('nao', nao), ('MAX_NAO', max_nao)]
+
+    if xctype == 'LDA':
+        rho_gpu = _fused_rho_kernel(
+            inputs=kernel_inputs,
+            grid=(ngrids * max_nao, 1, 1),
+            threadgroup=(max_nao, 1, 1),
+            output_shapes=[(ngrids,)],
+            output_dtypes=[mx.float32],
+            template=kernel_template,
+        )
+        mx.eval(rho_gpu[0])
+        rho = np.array(rho_gpu[0], dtype=np.float64)
+    else:  # GGA
+        rho_gpu = _fused_rho_gga_kernel(
+            inputs=kernel_inputs,
+            grid=(ngrids * max_nao, 1, 1),
+            threadgroup=(max_nao, 1, 1),
+            output_shapes=[(ngrids * 4,)],
+            output_dtypes=[mx.float32],
+            template=kernel_template,
+        )
+        mx.eval(rho_gpu[0])
+        rho = np.array(rho_gpu[0], dtype=np.float64).reshape(ngrids, 4).T
 
     # XC on CPU
-    exc, vxc = ni.eval_xc_eff(xc_code, rho, deriv=1, xctype='LDA', spin=0)[:2]
-    den = rho * weights
+    exc, vxc = ni.eval_xc_eff(xc_code, rho, deriv=1, xctype=xctype, spin=0)[:2]
+    den = (rho if xctype == 'LDA' else rho[0]) * weights
     nelec = den.sum()
     excsum = np.dot(den, exc)
 
-    # Vxc contraction still uses batched approach (needs AO array for gemm)
+    # Vxc contraction uses batched approach (needs AO array for gemm)
     wv = weights * vxc
+    ao_deriv = 1 if xctype == 'GGA' else 0
     vmat = np.zeros((nao, nao))
-    dm_gpu_2d = mx.array(np.asarray(dm, dtype=np.float32))
     BATCH = 20000
     for p0 in range(0, ngrids, BATCH):
         p1 = min(p0 + BATCH, ngrids)
+        ng = p1 - p0
         ao_gpu = _eval_ao_batch_gpu(
-            mol, coords[p0:p1], 0, shell_data, exps_gpu, coeffs_gpu,
-            ncart_total, shell_mapping, p1 - p0)
-        wv_gpu = mx.array(wv[0][p0:p1].astype(np.float32))
-        vmat_blk = (ao_gpu * wv_gpu[None, :]) @ mx.transpose(ao_gpu)
+            mol, coords[p0:p1], ao_deriv, shell_data, exps_gpu, coeffs_gpu,
+            ncart_total, shell_mapping, ng)
+
+        if xctype == 'LDA':
+            wv_gpu = mx.array(wv[0][p0:p1].astype(np.float32))
+            vmat_blk = (ao_gpu * wv_gpu[None, :]) @ mx.transpose(ao_gpu)
+        else:  # GGA
+            wv_b = wv[:, p0:p1].copy()
+            wv_b[0] *= 0.5
+            wv_gpu = [mx.array(wv_b[d].astype(np.float32)) for d in range(4)]
+            ao_val = ao_gpu[0]
+            aow = ao_gpu[0] * wv_gpu[0][None, :]
+            for d in range(1, 4):
+                aow = aow + ao_gpu[d] * wv_gpu[d][None, :]
+            vmat_blk = aow @ mx.transpose(ao_val)
+
         mx.eval(vmat_blk)
         vmat += np.array(vmat_blk, dtype=np.float64)
+
+    if xctype == 'GGA':
+        vmat = vmat + vmat.T
 
     return nelec, excsum, vmat
 
