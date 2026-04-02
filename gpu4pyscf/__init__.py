@@ -31,7 +31,10 @@ if BACKEND_NAME == 'cupy':
 import importlib as _importlib
 
 def __getattr__(name):
-    _submodules = {'grad', 'hessian', 'solvent', 'scf', 'dft', 'tdscf', 'nac'}
+    _submodules = {
+        'grad', 'hessian', 'solvent', 'scf', 'dft', 'tdscf', 'nac',
+        'df', 'mp', 'cc', 'qmmm', 'pbc', 'properties', 'tools', 'md',
+    }
     if name in _submodules:
         try:
             return _importlib.import_module(f'.{name}', __name__)

@@ -24,6 +24,8 @@ if BACKEND_NAME == 'cupy':
     from .ghf import GHF
     from .rohf import ROHF
     from . import dispersion
+else:
+    from pyscf.scf import ROHF, GHF
 
 def HF(mol, *args):
     if mol.nelectron == 1 or mol.spin == 0:
