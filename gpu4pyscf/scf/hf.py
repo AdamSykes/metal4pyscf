@@ -243,7 +243,14 @@ if BACKEND_NAME == 'cupy':
 else:
     def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True, omega=None,
                verbose=None):
-        '''Compute J, K matrices using PySCF CPU engine (fallback).'''
+        '''Compute J, K matrices using PySCF CPU engine.
+
+        The Metal Rys GPU engine is available via get_jk_rys_metal() for
+        direct use, but PySCF's C engine is used for SCF convergence
+        stability (f32 Rys J/K causes DIIS instability at tight thresholds).
+        For GPU-accelerated J/K, use density_fit() which routes through
+        the Metal DF-J/K engine.
+        '''
         dm_np = np.asarray(dm)
         with mol.with_range_coulomb(omega):
             vj, vk = hf_cpu.get_jk(mol, dm_np, hermi, None, with_j, with_k, omega)
