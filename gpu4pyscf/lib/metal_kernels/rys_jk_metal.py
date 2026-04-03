@@ -26,22 +26,174 @@ from gpu4pyscf.lib.metal_kernels.rys_jk import boys_function, _rys_from_boys
 
 _RYS_JK_HEADER = '''
 constant int NCART[] = {1, 3, 6, 10};
-
-// Cartesian indices packed as lx*16+ly*4+lz, flat with offsets
 constant int CART_ALL[] = {
-    0,                                              // l=0: s (0,0,0)
-    16, 4, 1,                                       // l=1: p (1,0,0),(0,1,0),(0,0,1)
-    32, 20, 17, 8, 5, 2,                            // l=2: d
-    48, 36, 33, 24, 21, 18, 12, 9, 6, 3             // l=3: f
+    0,
+    16, 4, 1,
+    32, 20, 17, 8, 5, 2,
+    48, 36, 33, 24, 21, 18, 12, 9, 6, 3
 };
-constant int CART_OFF[] = {0, 1, 4, 10};  // offsets into CART_ALL
+constant int CART_OFF[] = {0, 1, 4, 10};
+
+// erf approximation for Metal (Abramowitz & Stegun 7.1.26, max error 1.5e-7)
+inline float metal_erf(float x) {
+    float ax = abs(x);
+    float t = 1.0f / (1.0f + 0.3275911f * ax);
+    float poly = t * (0.254829592f + t * (-0.284496736f + t * (1.421413741f +
+                 t * (-1.453152027f + t * 1.061405429f))));
+    float result = 1.0f - poly * exp(-ax * ax);
+    return (x >= 0) ? result : -result;
+}
+
+// Boys function F_m(t) for m=0..max_m, in f32
+// 3 regimes matching CUDA gamma_inc.cu
+inline void boys_fn(thread float* f, float t, int m) {
+    if (t < 1e-7f) {
+        f[0] = 1.0f;
+        for (int i = 1; i <= m; i++)
+            f[i] = 1.0f / (2*i + 1);
+        return;
+    }
+    if (m > 0 && t < m * 0.5f + 0.5f) {
+        float bi = m + 0.5f;
+        float e = 0.5f * exp(-t);
+        float x = e, s = e;
+        for (int iter = 0; iter < 50 && x > 1e-7f * e; iter++) {
+            bi += 1.0f; x *= t / bi; s += x;
+        }
+        float b = m + 0.5f;
+        float fval = s / b;
+        f[m] = fval;
+        for (int i = m - 1; i >= 0; i--) {
+            b -= 1.0f;
+            fval = (e + t * fval) / b;
+            f[i] = fval;
+        }
+        return;
+    }
+    float tt = sqrt(t);
+    float fval = 0.886226925f / tt * metal_erf(tt); // sqrt(pi/4)/tt * erf(tt)
+    f[0] = fval;
+    if (m > 0) {
+        float e = 0.5f * exp(-t);
+        float b = 1.0f / t;
+        float b1 = 0.5f;
+        for (int i = 1; i <= m; i++) {
+            fval = b * (b1 * fval - e);
+            f[i] = fval;
+            b1 += 1.0f;
+        }
+    }
+}
+
+// Rys roots for nroots=1: root = F1/F0, weight = F0
+// Rys roots for nroots=2: Hankel 2x2 solve
+// Rys roots for nroots=3: Hankel 3x3 solve (simplified)
+inline void rys_roots_1(thread float* fm, thread float* roots, thread float* weights) {
+    weights[0] = fm[0];
+    roots[0] = (fm[0] > 1e-15f) ? fm[1] / fm[0] : 0.0f;
+}
+
+inline void rys_roots_2(thread float* fm, thread float* roots, thread float* weights) {
+    // Hankel 2x2: [F0 F1; F1 F2] @ c = [F2, F3]
+    float det = fm[0]*fm[2] - fm[1]*fm[1];
+    if (abs(det) < 1e-20f) {
+        float t = (fm[0] > 1e-15f) ? fm[1]/fm[0] : 0.0f;
+        roots[0] = roots[1] = t;
+        weights[0] = weights[1] = fm[0] * 0.5f;
+        return;
+    }
+    float c0 = (fm[2]*fm[2] - fm[1]*fm[3]) / det;
+    float c1 = (fm[0]*fm[3] - fm[1]*fm[2]) / det;
+    float disc = c1*c1 + 4*c0;
+    if (disc < 0) disc = 0;
+    float sq = sqrt(disc);
+    roots[0] = (c1 - sq) * 0.5f;
+    roots[1] = (c1 + sq) * 0.5f;
+    if (abs(roots[1] - roots[0]) < 1e-15f) {
+        weights[0] = weights[1] = fm[0] * 0.5f;
+    } else {
+        weights[1] = (fm[1] - fm[0]*roots[0]) / (roots[1] - roots[0]);
+        weights[0] = fm[0] - weights[1];
+    }
+}
+
+inline void rys_roots_3(thread float* fm, thread float* roots, thread float* weights) {
+    // Hankel 3x3 solve: simplified Cramer's rule
+    float H[3][3] = {{fm[0],fm[1],fm[2]},{fm[1],fm[2],fm[3]},{fm[2],fm[3],fm[4]}};
+    float rhs[3] = {fm[3], fm[4], fm[5]};
+    // Gaussian elimination
+    for (int col = 0; col < 3; col++) {
+        int pivot = col;
+        for (int row = col+1; row < 3; row++)
+            if (abs(H[row][col]) > abs(H[pivot][col])) pivot = row;
+        if (pivot != col) {
+            for (int j = 0; j < 3; j++) { float t=H[col][j]; H[col][j]=H[pivot][j]; H[pivot][j]=t; }
+            float t=rhs[col]; rhs[col]=rhs[pivot]; rhs[pivot]=t;
+        }
+        if (abs(H[col][col]) < 1e-20f) continue;
+        for (int row = col+1; row < 3; row++) {
+            float fac = H[row][col] / H[col][col];
+            for (int j = col; j < 3; j++) H[row][j] -= fac * H[col][j];
+            rhs[row] -= fac * rhs[col];
+        }
+    }
+    float c[3];
+    for (int i = 2; i >= 0; i--) {
+        float s = rhs[i];
+        for (int j = i+1; j < 3; j++) s -= H[i][j] * c[j];
+        c[i] = (abs(H[i][i]) > 1e-20f) ? s / H[i][i] : 0.0f;
+    }
+    // Roots of t^3 - c[2]*t^2 - c[1]*t - c[0] = 0
+    // Cardano's formula or Newton iteration
+    // Use Newton iteration from 3 initial guesses
+    float p = -c[2], q = -c[1], r = -c[0]; // t^3 + p*t^2 + q*t + r = 0
+    // Initial guesses spread in [0,1]
+    roots[0] = 0.1f; roots[1] = 0.4f; roots[2] = 0.8f;
+    for (int iter = 0; iter < 20; iter++) {
+        for (int k = 0; k < 3; k++) {
+            float t = roots[k];
+            float f = t*t*t + p*t*t + q*t + r;
+            float fp = 3*t*t + 2*p*t + q;
+            if (abs(fp) > 1e-15f) roots[k] -= f / fp;
+            roots[k] = clamp(roots[k], 0.0f, 1.0f);
+        }
+    }
+    // Sort
+    if (roots[0] > roots[1]) { float t=roots[0]; roots[0]=roots[1]; roots[1]=t; }
+    if (roots[1] > roots[2]) { float t=roots[1]; roots[1]=roots[2]; roots[2]=t; }
+    if (roots[0] > roots[1]) { float t=roots[0]; roots[0]=roots[1]; roots[1]=t; }
+    // Weights from Vandermonde
+    float V[3][3];
+    for (int i = 0; i < 3; i++) { V[i][0]=1; V[i][1]=roots[i]; V[i][2]=roots[i]*roots[i]; }
+    // Solve V^T @ w = fm[0:3] via Gaussian elimination
+    float VT[3][3]; for(int i=0;i<3;i++) for(int j=0;j<3;j++) VT[i][j]=V[j][i];
+    float wrhs[3] = {fm[0], fm[1], fm[2]};
+    for (int col = 0; col < 3; col++) {
+        int piv = col;
+        for (int row = col+1; row < 3; row++)
+            if (abs(VT[row][col]) > abs(VT[piv][col])) piv = row;
+        if (piv != col) {
+            for (int j=0;j<3;j++){float t=VT[col][j];VT[col][j]=VT[piv][j];VT[piv][j]=t;}
+            float t=wrhs[col]; wrhs[col]=wrhs[piv]; wrhs[piv]=t;
+        }
+        for (int row = col+1; row < 3; row++) {
+            float fac = VT[row][col] / (VT[col][col] + 1e-30f);
+            for (int j=col;j<3;j++) VT[row][j] -= fac*VT[col][j];
+            wrhs[row] -= fac*wrhs[col];
+        }
+    }
+    for (int i=2;i>=0;i--) {
+        float s=wrhs[i]; for(int j=i+1;j<3;j++) s-=VT[i][j]*weights[j];
+        weights[i] = s / (VT[i][i] + 1e-30f);
+    }
+}
 '''
 
 _RYS_JK_SOURCE = '''
 uint tid = thread_position_in_grid.x;
 if (tid >= n_tasks) return;
 
-// Load task data: each task = one (primitive quartet, Rys root) pair
+// Load task data: each task = one primitive quartet
 int task_off = tid * TASK_STRIDE;
 float aij   = task_data[task_off + 0];
 float akl   = task_data[task_off + 1];
@@ -61,21 +213,38 @@ float Rpq_x = task_data[task_off + 14];
 float Rpq_y = task_data[task_off + 15];
 float Rpq_z = task_data[task_off + 16];
 float prefac = task_data[task_off + 17];
-float rys_root   = task_data[task_off + 18];
-float rys_weight = task_data[task_off + 19];
-int i0 = (int)task_data[task_off + 20];
-int j0 = (int)task_data[task_off + 21];
-int k0 = (int)task_data[task_off + 22];
-int l0 = (int)task_data[task_off + 23];
-int li = (int)task_data[task_off + 24];
-int lj = (int)task_data[task_off + 25];
-int lk = (int)task_data[task_off + 26];
-int ll = (int)task_data[task_off + 27];
+int i0 = (int)task_data[task_off + 18];
+int j0 = (int)task_data[task_off + 19];
+int k0 = (int)task_data[task_off + 20];
+int l0 = (int)task_data[task_off + 21];
+int li = (int)task_data[task_off + 22];
+int lj = (int)task_data[task_off + 23];
+int lk = (int)task_data[task_off + 24];
+int ll = (int)task_data[task_off + 25];
 
 int lij = li + lj;
 int lkl = lk + ll;
-float rt = rys_root;
-float wt = rys_weight;
+int nroots = (li + lj + lk + ll) / 2 + 1;
+
+// Compute Boys function on GPU
+float theta = aij * akl / (aij + akl);
+float rr_pq = Rpq_x*Rpq_x + Rpq_y*Rpq_y + Rpq_z*Rpq_z;
+float x = theta * rr_pq;
+int m_max = max(li+lj+lk+ll, 2*nroots-1);
+float fm[14]; // max m_max = 13 for ffff
+boys_fn(fm, x, m_max);
+
+// Compute Rys roots and weights on GPU
+float rys_roots[7], rys_weights[7]; // max nroots=7
+if (nroots == 1) rys_roots_1(fm, rys_roots, rys_weights);
+else if (nroots == 2) rys_roots_2(fm, rys_roots, rys_weights);
+else if (nroots == 3) rys_roots_3(fm, rys_roots, rys_weights);
+// nroots > 3 not yet supported in MSL
+
+// Loop over Rys roots
+for (int iroot = 0; iroot < nroots; iroot++) {
+float rt = rys_roots[iroot];
+float wt = rys_weights[iroot];
 
 // Rys-modified recurrence coefficients
 float rt_aa = rt / (aij + akl);
@@ -185,6 +354,7 @@ for (int ii = 0; ii < ni; ii++) {
         atomic_fetch_add_explicit(&vj[(i0+ii)*nao + (j0+jj)], j_contrib, memory_order_relaxed);
     }
 }
+} // end root loop
 '''
 
 _rys_jk_kernel = mx.fast.metal_kernel(
@@ -196,7 +366,7 @@ _rys_jk_kernel = mx.fast.metal_kernel(
     atomic_outputs=True,
 )
 
-TASK_STRIDE = 28  # floats per task
+TASK_STRIDE = 26  # floats per task (no roots/weights — computed on GPU)
 
 
 def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
@@ -281,31 +451,24 @@ def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
                                     prefac *= (fac_l.get(li, 1.0) * fac_l.get(lj, 1.0) *
                                                fac_l.get(lk, 1.0) * fac_l.get(ll, 1.0))
 
-                                    m_max = max(li + lj + lk + ll, 2 * nroots - 1)
-                                    fm = boys_function(m_max, [x])
-                                    roots, weights = _rys_from_boys(nroots, fm[:, 0])
-
-                                    for ir in range(nroots):
-                                        task = np.zeros(TASK_STRIDE, dtype=np.float32)
-                                        task[0] = aij
-                                        task[1] = akl
-                                        task[2:5] = PA
-                                        task[5:8] = QC
-                                        task[8:11] = AB
-                                        task[11:14] = CD
-                                        task[14:17] = Rpq
-                                        task[17] = prefac
-                                        task[18] = roots[ir]
-                                        task[19] = weights[ir]
-                                        task[20] = i0
-                                        task[21] = j0
-                                        task[22] = k0
-                                        task[23] = l0
-                                        task[24] = li
-                                        task[25] = lj
-                                        task[26] = lk
-                                        task[27] = ll
-                                        tasks.append(task)
+                                    task = np.zeros(TASK_STRIDE, dtype=np.float32)
+                                    task[0] = aij
+                                    task[1] = akl
+                                    task[2:5] = PA
+                                    task[5:8] = QC
+                                    task[8:11] = AB
+                                    task[11:14] = CD
+                                    task[14:17] = Rpq
+                                    task[17] = prefac
+                                    task[18] = i0
+                                    task[19] = j0
+                                    task[20] = k0
+                                    task[21] = l0
+                                    task[22] = li
+                                    task[23] = lj
+                                    task[24] = lk
+                                    task[25] = ll
+                                    tasks.append(task)
 
     if not tasks:
         return (np.zeros((nao, nao)) if with_j else None,
