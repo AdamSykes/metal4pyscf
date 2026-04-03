@@ -369,6 +369,138 @@ _rys_jk_kernel = mx.fast.metal_kernel(
 TASK_STRIDE = 26  # floats per task (no roots/weights — computed on GPU)
 
 
+def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l):
+    """Build all primitive quartet tasks using numpy vectorization.
+
+    Replaces the 8-deep Python loop with vectorized operations.
+    Shell loop is still Python (unavoidable for variable nprim),
+    but primitive loops within each shell quartet are vectorized.
+    """
+    # Precompute per-shell data
+    shell_l = np.array([mol.bas_angular(i) for i in range(nbas)])
+    shell_atom = np.array([mol.bas_atom(i) for i in range(nbas)])
+    atom_coords = np.array([mol.atom_coord(i) for i in range(mol.natm)])
+    shell_R = atom_coords[shell_atom]  # (nbas, 3)
+    shell_i0 = np.array([ao_loc[i] for i in range(nbas)])
+
+    # Precompute exponents and coefficients per shell
+    shell_exps = [mol.bas_exp(i) for i in range(nbas)]
+    shell_coeffs = [mol._libcint_ctr_coeff(i).flatten() for i in range(nbas)]
+
+    all_tasks = []
+
+    # Shell quartet loop (Python — nbas^4 iterations, typically ~300K for def2-TZVPP)
+    # But each iteration generates all primitive tasks vectorized
+    for ish in range(nbas):
+        li = shell_l[ish]
+        if li > 3: continue
+        Ri = shell_R[ish]
+        ai_arr = shell_exps[ish]
+        ci_arr = shell_coeffs[ish]
+
+        for jsh in range(nbas):
+            lj = shell_l[jsh]
+            if lj > 3: continue
+            Rj = shell_R[jsh]
+            aj_arr = shell_exps[jsh]
+            cj_arr = shell_coeffs[jsh]
+            rr_ij = np.dot(Ri - Rj, Ri - Rj)
+            AB = Ri - Rj
+
+            # Vectorize over ij primitives
+            ni, nj = len(ai_arr), len(aj_arr)
+            ai_2d = np.repeat(ai_arr, nj)      # (ni*nj,)
+            aj_2d = np.tile(aj_arr, ni)
+            ci_2d = np.repeat(ci_arr, nj)
+            cj_2d = np.tile(cj_arr, ni)
+            aij = ai_2d + aj_2d
+            Kab = np.exp(-ai_2d * aj_2d / aij * rr_ij)
+            Pij = (ai_2d[:, None] * Ri + aj_2d[:, None] * Rj) / aij[:, None]  # (ni*nj, 3)
+            PA = Pij - Ri
+            cicj_Kab = ci_2d * cj_2d * Kab
+
+            for ksh in range(nbas):
+                lk = shell_l[ksh]
+                if lk > 3: continue
+                Rk = shell_R[ksh]
+                ak_arr = shell_exps[ksh]
+                ck_arr = shell_coeffs[ksh]
+
+                for lsh in range(nbas):
+                    ll = shell_l[lsh]
+                    if ll > 3: continue
+                    Rl = shell_R[lsh]
+                    al_arr = shell_exps[lsh]
+                    cl_arr = shell_coeffs[lsh]
+                    rr_kl = np.dot(Rk - Rl, Rk - Rl)
+                    CD = Rk - Rl
+
+                    # Vectorize over kl primitives
+                    nk, nl = len(ak_arr), len(al_arr)
+                    ak_2d = np.repeat(ak_arr, nl)
+                    al_2d = np.tile(al_arr, nk)
+                    ck_2d = np.repeat(ck_arr, nl)
+                    cl_2d = np.tile(cl_arr, nk)
+                    akl = ak_2d + al_2d
+                    Kcd = np.exp(-ak_2d * al_2d / akl * rr_kl)
+                    Pkl = (ak_2d[:, None] * Rk + al_2d[:, None] * Rl) / akl[:, None]
+                    QC = Pkl - Rk
+                    ckcl_Kcd = ck_2d * cl_2d * Kcd
+
+                    # Cross-product: all (ij, kl) combinations
+                    n_ij = ni * nj
+                    n_kl = nk * nl
+                    # Expand to (n_ij * n_kl) tasks
+                    aij_all = np.repeat(aij, n_kl)
+                    akl_all = np.tile(akl, n_ij)
+                    PA_all = np.repeat(PA, n_kl, axis=0)
+                    QC_all = np.tile(QC, (n_ij, 1))
+                    Pij_all = np.repeat(Pij, n_kl, axis=0)
+                    Pkl_all = np.tile(Pkl, (n_ij, 1))
+                    Rpq_all = Pij_all - Pkl_all
+                    coeff_all = np.repeat(cicj_Kab, n_kl) * np.tile(ckcl_Kcd, n_ij)
+
+                    # Screening
+                    mask = np.abs(coeff_all) > 1e-14
+                    if not np.any(mask):
+                        continue
+
+                    aij_m = aij_all[mask]
+                    akl_m = akl_all[mask]
+                    PA_m = PA_all[mask]
+                    QC_m = QC_all[mask]
+                    Rpq_m = Rpq_all[mask]
+                    coeff_m = coeff_all[mask]
+
+                    prefac = coeff_m * 2.0 * pi**2.5 / (aij_m * akl_m * np.sqrt(aij_m + akl_m))
+                    fac = fac_l.get(li, 1.0) * fac_l.get(lj, 1.0) * fac_l.get(lk, 1.0) * fac_l.get(ll, 1.0)
+                    prefac *= fac
+
+                    ntasks = len(prefac)
+                    block = np.zeros((ntasks, TASK_STRIDE), dtype=np.float32)
+                    block[:, 0] = aij_m
+                    block[:, 1] = akl_m
+                    block[:, 2:5] = PA_m
+                    block[:, 5:8] = QC_m
+                    block[:, 8] = AB[0]; block[:, 9] = AB[1]; block[:, 10] = AB[2]
+                    block[:, 11] = CD[0]; block[:, 12] = CD[1]; block[:, 13] = CD[2]
+                    block[:, 14:17] = Rpq_m
+                    block[:, 17] = prefac
+                    block[:, 18] = shell_i0[ish]
+                    block[:, 19] = shell_i0[jsh]
+                    block[:, 20] = shell_i0[ksh]
+                    block[:, 21] = shell_i0[lsh]
+                    block[:, 22] = li
+                    block[:, 23] = lj
+                    block[:, 24] = lk
+                    block[:, 25] = ll
+                    all_tasks.append(block)
+
+    if all_tasks:
+        return np.concatenate(all_tasks, axis=0)
+    return np.zeros((0, TASK_STRIDE), dtype=np.float32)
+
+
 def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
     """Direct J/K on Metal GPU via Rys quadrature.
 
@@ -381,103 +513,17 @@ def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
     ao_loc = mol.ao_loc_nr()
     fac_l = {0: sqrt(1.0 / (4 * pi)), 1: sqrt(3.0 / (4 * pi))}
 
-    # --- Phase 1: CPU — enumerate tasks and compute Rys roots ---
-    tasks = []
+    # --- Phase 1: vectorized task generation (no Python loops over primitives) ---
+    tasks = _build_tasks_vectorized(mol, ao_loc, nbas, fac_l)
 
-    for ish in range(nbas):
-        li = mol.bas_angular(ish)
-        if li > 3: continue
-        i0 = ao_loc[ish]
-        Ri = mol.atom_coord(mol.bas_atom(ish))
-        ai_list = mol.bas_exp(ish)
-        ci_list = mol._libcint_ctr_coeff(ish).flatten()
-
-        for jsh in range(nbas):
-            lj = mol.bas_angular(jsh)
-            if lj > 3: continue
-            j0 = ao_loc[jsh]
-            Rj = mol.atom_coord(mol.bas_atom(jsh))
-            aj_list = mol.bas_exp(jsh)
-            cj_list = mol._libcint_ctr_coeff(jsh).flatten()
-            rr_ij = np.dot(Ri - Rj, Ri - Rj)
-
-            for ksh in range(nbas):
-                lk = mol.bas_angular(ksh)
-                if lk > 3: continue
-                k0 = ao_loc[ksh]
-                Rk = mol.atom_coord(mol.bas_atom(ksh))
-                ak_list = mol.bas_exp(ksh)
-                ck_list = mol._libcint_ctr_coeff(ksh).flatten()
-
-                for lsh in range(nbas):
-                    ll = mol.bas_angular(lsh)
-                    if ll > 3: continue
-                    l0 = ao_loc[lsh]
-                    Rl = mol.atom_coord(mol.bas_atom(lsh))
-                    al_list = mol.bas_exp(lsh)
-                    cl_list = mol._libcint_ctr_coeff(lsh).flatten()
-                    rr_kl = np.dot(Rk - Rl, Rk - Rl)
-                    nroots = (li + lj + lk + ll) // 2 + 1
-
-                    PA = np.zeros(3)  # filled per primitive
-                    QC = np.zeros(3)
-                    AB = Ri - Rj
-                    CD = Rk - Rl
-
-                    for ip, ai in enumerate(ai_list):
-                        for jp, aj in enumerate(aj_list):
-                            aij = ai + aj
-                            Pij = (ai * Ri + aj * Rj) / aij
-                            Kab = np.exp(-ai * aj / aij * rr_ij)
-                            PA = Pij - Ri
-
-                            for kp, ak in enumerate(ak_list):
-                                for lp, al in enumerate(al_list):
-                                    akl = ak + al
-                                    Pkl = (ak * Rk + al * Rl) / akl
-                                    Kcd = np.exp(-ak * al / akl * rr_kl)
-                                    QC = Pkl - Rk
-
-                                    coeff = (ci_list[ip] * cj_list[jp] * Kab *
-                                             ck_list[kp] * cl_list[lp] * Kcd)
-                                    if abs(coeff) < 1e-14:
-                                        continue
-
-                                    theta = aij * akl / (aij + akl)
-                                    Rpq = Pij - Pkl
-                                    x = theta * np.dot(Rpq, Rpq)
-
-                                    prefac = coeff * 2.0 * pi**2.5 / (aij * akl * sqrt(aij + akl))
-                                    prefac *= (fac_l.get(li, 1.0) * fac_l.get(lj, 1.0) *
-                                               fac_l.get(lk, 1.0) * fac_l.get(ll, 1.0))
-
-                                    task = np.zeros(TASK_STRIDE, dtype=np.float32)
-                                    task[0] = aij
-                                    task[1] = akl
-                                    task[2:5] = PA
-                                    task[5:8] = QC
-                                    task[8:11] = AB
-                                    task[11:14] = CD
-                                    task[14:17] = Rpq
-                                    task[17] = prefac
-                                    task[18] = i0
-                                    task[19] = j0
-                                    task[20] = k0
-                                    task[21] = l0
-                                    task[22] = li
-                                    task[23] = lj
-                                    task[24] = lk
-                                    task[25] = ll
-                                    tasks.append(task)
-
-    if not tasks:
+    if len(tasks) == 0:
         return (np.zeros((nao, nao)) if with_j else None,
                 np.zeros((nao, nao)) if with_k else None)
 
     # --- Phase 2: Metal GPU kernel ---
-    task_array = mx.array(np.stack(tasks).ravel())
+    task_array = mx.array(tasks.ravel())
     dm_gpu = mx.array(dm.astype(np.float32).ravel())
-    n_tasks = len(tasks)
+    n_tasks = tasks.shape[0]
 
     THREADS = 256
     grid_size = ((n_tasks + THREADS - 1) // THREADS) * THREADS
