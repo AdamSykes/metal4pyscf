@@ -188,7 +188,8 @@ Apple Silicon shares RAM between CPU and GPU. This means:
 | TDDFT / TDA | Ported | CPU fallback with f64 refinement (error < 3e-6 eV) |
 | QM/MM | Not ported | Not started |
 | PBC (periodic) | Not ported | Not started |
-| Metal GPU acceleration | Active | DF-J/K 6-12x, eval_ao 1.1x, XC contraction 1.2x, end-to-end 1.4-3.5x |
+| Metal GPU acceleration | Active | DF-J/K 6-12x, eval_ao 1.1x, XC contraction 3.6x, end-to-end 1.5-3.9x |
+| Rys integral engine | Working (CPU) | Direct J/K for s/p/d/f, machine precision on def2-TZVPP |
 
 ## Roadmap for Metal GPU Acceleration
 
