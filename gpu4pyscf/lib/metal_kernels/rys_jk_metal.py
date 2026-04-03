@@ -29,10 +29,10 @@ constant int NCART[] = {1, 3, 6, 10};
 
 // Cartesian indices packed as lx*16+ly*4+lz, flat with offsets
 constant int CART_ALL[] = {
-    0,                                              // l=0: s
-    64, 16, 4,                                      // l=1: p
-    128, 80, 68, 32, 20, 8,                         // l=2: d
-    192, 144, 132, 96, 84, 72, 48, 36, 24, 12       // l=3: f
+    0,                                              // l=0: s (0,0,0)
+    16, 4, 1,                                       // l=1: p (1,0,0),(0,1,0),(0,0,1)
+    32, 20, 17, 8, 5, 2,                            // l=2: d
+    48, 36, 33, 24, 21, 18, 12, 9, 6, 3             // l=3: f
 };
 constant int CART_OFF[] = {0, 1, 4, 10};  // offsets into CART_ALL
 '''
