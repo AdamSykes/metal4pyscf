@@ -178,7 +178,7 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
 
             for ksh in range(nbas):
                 lk = mol.bas_angular(ksh)
-                if lk > 1:
+                if lk > 3:
                     continue
                 k0, k1 = ao_loc[ksh], ao_loc[ksh + 1]
                 nk = _ncart(lk)
