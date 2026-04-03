@@ -168,7 +168,7 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
 
         for jsh in range(nbas):
             lj = mol.bas_angular(jsh)
-            if lj > 1:
+            if lj > 3:
                 continue
             j0, j1 = ao_loc[jsh], ao_loc[jsh + 1]
             nj = _ncart(lj)
@@ -188,7 +188,7 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
 
                 for lsh in range(nbas):
                     ll = mol.bas_angular(lsh)
-                    if ll > 1:
+                    if ll > 3:
                         continue
                     l0, l1 = ao_loc[lsh], ao_loc[lsh + 1]
                     nl = _ncart(ll)
@@ -243,13 +243,15 @@ def get_jk_rys(mol, dm, with_j=True, with_k=True):
                                         Ri, Rj, Rk, Rl, Pij, Pkl,
                                         li, lj, lk, ll, nroots)
 
-                    # Cart → spherical transformation
+                    # Cart → spherical: contract c2s matrix with each cart index
                     if not mol.cart:
-                        for idx, lv in enumerate([li, lj, lk, ll]):
+                        for idx in range(4):
+                            lv = [li,lj,lk,ll][idx]
                             if lv >= 2:
-                                c2s = _cart2sph_matrix(lv)
-                                eri = np.tensordot(c2s.T, eri, axes=([1],[idx]))
-                                eri = np.moveaxis(eri, 0, idx)
+                                c = _cart2sph_matrix(lv)  # (ncart, nsph)
+                                eri = np.tensordot(eri, c, axes=([idx], [0]))
+                                # tensordot puts the new axis at the end; roll it back
+                                eri = np.moveaxis(eri, -1, idx)
 
                     # Accumulate J and K (using spherical ao_loc indices)
                     if with_j:
@@ -286,6 +288,19 @@ def _rys_build_eri(eri, prefac, fm, ai, aj, ak, al, aij, akl,
         3: [(3,0,0),(2,1,0),(2,0,1),(1,2,0),(1,1,1),(1,0,2),
             (0,3,0),(0,2,1),(0,1,2),(0,0,3)],
     }
+
+    def _cart_norm(lx, ly, lz):
+        """Cartesian GTO angular normalization: 1/sqrt((2lx-1)!!*(2ly-1)!!*(2lz-1)!!)
+
+        The TRR produces integrals with x^n factors that are too large by this factor.
+        Divide by it to match the libcint convention.
+        """
+        def _dfact(n):
+            r = 1
+            while n > 0:
+                r *= n; n -= 2
+            return r
+        return 1.0 / sqrt(float(_dfact(2*lx-1) * _dfact(2*ly-1) * _dfact(2*lz-1)))
 
     for iroot in range(nroots):
         rt = roots[iroot]
@@ -325,7 +340,7 @@ def _rys_build_eri(eri, prefac, fm, ai, aj, ak, al, aij, akl,
                     g_ijc[a, 0, c] = g[a, c]
             for j in range(lj):
                 for c in range(lkl + 1):
-                    for i in range(li + 1):
+                    for i in range(lij - j - 1 + 1):
                         g_ijc[i, j + 1, c] = g_ijc[i + 1, j, c] + ABx[ix] * g_ijc[i, j, c]
 
             g_full = np.zeros((li + 1, lj + 1, lkl + 1, ll + 1))
@@ -334,7 +349,7 @@ def _rys_build_eri(eri, prefac, fm, ai, aj, ak, al, aij, akl,
                     for c in range(lkl + 1):
                         g_full[i, j, c, 0] = g_ijc[i, j, c]
                     for l_idx in range(ll):
-                        for k in range(lk + 1):
+                        for k in range(lkl - l_idx - 1 + 1):
                             g_full[i, j, k, l_idx + 1] = (g_full[i, j, k + 1, l_idx] +
                                                             CDx[ix] * g_full[i, j, k, l_idx])
             g1d[ix] = g_full[:li+1, :lj+1, :lk+1, :ll+1]
