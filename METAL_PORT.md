@@ -182,14 +182,15 @@ Apple Silicon shares RAM between CPU and GPU. This means:
 | UKS | Ported | Working on MLX backend |
 | RHF/RKS/UHF/UKS gradients | Ported | CPU fallback with f64 refinement (grad error ~1e-7) |
 | Geometry optimization | Working | Via geomeTRIC or PySCF berny with gradients |
-| ROHF, GHF | Not ported | `import cupy` in ghf.py, rohf.py |
+| ROHF, GHF | Ported | CPU fallback via PySCF |
 | Analytical Hessians | Ported | CPU fallback with f64 refinement (freq error < 0.01 cm⁻¹) |
 | Solvent models (PCM/SMD) | Ported | CPU fallback via PySCF (exact for non-DF, ~5e-6 for DF) |
 | TDDFT / TDA | Ported | CPU fallback with f64 refinement (error < 3e-6 eV) |
-| QM/MM | Not ported | Not started |
-| PBC (periodic) | Not ported | Not started |
 | Metal GPU acceleration | Active | DF-J/K 6-12x, eval_ao 1.1x, XC contraction 3.6x, end-to-end 1.5-3.9x |
-| Rys integral engine | Working (CPU) | Direct J/K for s/p/d/f, machine precision on def2-TZVPP |
+| Rys integral engine (CPU) | Working | Direct J/K for s/p/d/f, machine precision on def2-TZVPP |
+| Rys integral engine (Metal GPU) | Working (standalone) | Boys+TRR+HRR+ERI+J/K all on GPU, f32, 41x vs Python |
+| QM/MM | Ported | CPU fallback via PySCF |
+| PBC (periodic) | Ported | CPU fallback via PySCF |
 
 ## Roadmap for Metal GPU Acceleration
 
@@ -296,6 +297,57 @@ Attempted Metal acceleration of the XC grid integration (`numint_metal.py`). The
 | Vxc contraction | ~200 ms | Yes — but savings eaten by data conversion |
 
 **Result:** Metal XC gives 0.7x (slower) due to numpy↔MLX conversion overhead exceeding the GPU gemm savings. The Metal `numint_metal.py` implementation is correct but not faster than PySCF CPU.
+
+### Metal eval_ao (working)
+
+**File:** `gpu4pyscf/lib/metal_kernels/eval_ao.py`
+
+Translates PySCF's C-level `eval_gto` (Gaussian basis evaluation) to a Metal compute shader. Single kernel launch processes all (grid_point, shell) pairs in parallel. Supports l=0 through l=3 (s, p, d, f) with deriv=0 and deriv=1 (GGA gradients). Cart-to-spherical transformation on GPU.
+
+### Fused XC kernel with threadgroup shared memory
+
+**File:** `gpu4pyscf/lib/metal_kernels/fused_xc.py`
+
+Computes rho (and nabla rho for GGA) entirely in threadgroup shared memory — AO values never written to global memory. One threadgroup per grid point, nao threads. Includes analytical AO derivatives for s/p/d/f shells with full cart-to-spherical transform via precomputed lookup tables.
+
+Used for small molecules (nao ≤ 128) where the dm@ao inner loop fits in threadgroup parallelism. For larger nao, the batched gemm approach is faster.
+
+### Metal Rys Polynomial Integral Engine
+
+**Files:** `gpu4pyscf/lib/metal_kernels/rys_jk.py` (CPU reference), `gpu4pyscf/lib/metal_kernels/rys_jk_metal.py` (Metal GPU)
+
+Complete implementation of the Rys polynomial quadrature for 2-electron integrals, translated from the CUDA `gvhf-rys` engine.
+
+**CPU reference** (`rys_jk.py`):
+- Boys function F_m(t): 3-regime computation (series, asymptotic, erf)
+- Rys root extraction via Hankel matrix + Vandermonde solve (nroots 1-7)
+- Obara-Saika TRR with Rys-factorized 1D recurrence
+- HRR for j and l angular momentum transfer
+- Cart-to-spherical ERI transformation for d/f shells
+- Verified to machine precision on STO-3G, def2-SVP, def2-TZVPP
+
+**Metal GPU kernel** (`rys_jk_metal.py`):
+- Boys function in MSL (erf via Abramowitz-Stegun polynomial)
+- Rys roots for nroots 1-3 (Hankel solve in MSL)
+- Full TRR + HRR + Cartesian ERI assembly in MSL
+- J/K contraction with atomic float adds
+- Schwarz screening (precomputed Q bounds)
+- Vectorized numpy task generation (no Python loop over primitives)
+- One thread per primitive quartet, ~50K threads for H2O/STO-3G
+
+**Accuracy:** f32, ~1e-6 relative error for J/K matrices.
+
+**Performance:** 41x faster than the Python Rys reference. Dominated by CPU task enumeration (28ms), Metal kernel itself is <1ms.
+
+**SCF integration status:** The Metal Rys engine produces correct J/K matrices but **cannot be used directly in the SCF loop** — f32 atomic add noise (~1e-6 per cycle) causes DIIS divergence over multiple iterations. The DF path (with f64 CPU accumulation) does not have this problem.
+
+For non-DF SCF, PySCF's C engine is used (stable, fast). The Metal Rys engine is available as a standalone function:
+```python
+from gpu4pyscf.lib.metal_kernels.rys_jk_metal import get_jk_rys_metal
+vj, vk = get_jk_rys_metal(mol, dm)  # f32 J/K on Metal GPU
+```
+
+**Path to SCF integration:** Restructure the kernel to accumulate per-shell-pair results in f64 on CPU (same strategy as the DF engine), using Metal only for the per-primitive TRR/HRR inner loop. This would give f64-accurate J/K with GPU-accelerated integral evaluation.
 
 ### Metal eval_ao (working)
 
@@ -410,11 +462,13 @@ print(f'PCM energy: {mf_pcm.e_tot:.10f} Ha')
 
 ## Complete File Manifest
 
-### Files Created (16 files)
+### Files Created (21 files)
 
 | File | Purpose |
 |------|---------|
 | `METAL_PORT.md` | This document |
+| `README.md` | User-facing documentation |
+| `pyproject.toml` | Package metadata for `pip install` |
 | `gpu4pyscf/lib/backend.py` | Public API: `xp`, `device`, `memory`, `stream`, linalg |
 | `gpu4pyscf/lib/backends/__init__.py` | Auto-detect CuPy → MLX → NumPy |
 | `gpu4pyscf/lib/backends/cupy_backend.py` | CuPy/CUDA wrapper |
@@ -426,12 +480,15 @@ print(f'PCM energy: {mf_pcm.e_tot:.10f} Ha')
 | `gpu4pyscf/lib/backends/tests/test_backend_chemistry.py` | 24 chemistry tests |
 | `gpu4pyscf/lib/metal_kernels/__init__.py` | Metal compute shaders: dist_matrix, pack/unpack_tril, fill_triu |
 | `gpu4pyscf/lib/metal_kernels/eval_ao.py` | Metal eval_ao kernel (deriv=0,1) with cart2sph |
+| `gpu4pyscf/lib/metal_kernels/fused_xc.py` | Fused eval_ao+rho+Vxc with threadgroup shared memory |
+| `gpu4pyscf/lib/metal_kernels/rys_jk.py` | CPU Rys polynomial integral engine (reference) |
+| `gpu4pyscf/lib/metal_kernels/rys_jk_metal.py` | Metal GPU Rys integral engine (Boys+TRR+HRR+J/K) |
 | `gpu4pyscf/df/df_jk_metal.py` | Metal GPU DF-J/K engine with cached tensors |
 | `gpu4pyscf/dft/numint_metal.py` | Metal GPU XC integration (fused eval_ao + contraction) |
 | `gpu4pyscf/grad/_cpu_fallback.py` | RHF/RKS/UHF/UKS gradient CPU fallback |
 | `gpu4pyscf/hessian/_cpu_fallback.py` | RHF/RKS/UHF/UKS Hessian CPU fallback |
 
-### Files Modified (17 files)
+### Files Modified (29 files)
 
 | File | Change |
 |------|--------|
@@ -452,3 +509,14 @@ print(f'PCM energy: {mf_pcm.e_tot:.10f} Ha')
 | `gpu4pyscf/hessian/__init__.py` | Routes to CPU fallback on non-CUDA |
 | `gpu4pyscf/solvent/__init__.py` | Delegates to PySCF CPU solvent on non-CUDA |
 | `gpu4pyscf/tdscf/__init__.py` | Guards CUDA imports on non-CUDA |
+| `gpu4pyscf/df/__init__.py` | Guards cupy imports, falls back to PySCF DF |
+| `gpu4pyscf/mp/__init__.py` | Falls back to PySCF MP2/RMP2 |
+| `gpu4pyscf/cc/__init__.py` | Falls back to PySCF CCSD |
+| `gpu4pyscf/qmmm/__init__.py` | Falls back to PySCF QM/MM |
+| `gpu4pyscf/pbc/__init__.py` | Falls back to PySCF PBC |
+| `gpu4pyscf/properties/__init__.py` | Guards CUDA-only properties |
+| `gpu4pyscf/tools/__init__.py` | Guards CUDA-only tools |
+| `gpu4pyscf/md/__init__.py` | Guards CUDA-only MD |
+| `gpu4pyscf/nac/__init__.py` | Guards CUDA-only NAC |
+| `setup.py` → `setup_cuda.py` | Renamed to avoid nvcc requirement |
+| `tests/` (9 files) | Integration tests: SCF, DFT, grad, Hessian, TDDFT, solvent, MP2, CCSD, imports |
