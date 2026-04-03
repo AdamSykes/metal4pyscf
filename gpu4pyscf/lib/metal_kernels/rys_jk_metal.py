@@ -369,28 +369,41 @@ _rys_jk_kernel = mx.fast.metal_kernel(
 TASK_STRIDE = 26  # floats per task (no roots/weights — computed on GPU)
 
 
-def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l):
+def _schwarz_bounds(mol, nbas):
+    """Precompute Schwarz screening bounds Q[ish,jsh] = sqrt(max|(ij|ij)|).
+
+    Used to skip shell quartets where Q_ij * Q_kl < threshold.
+    """
+    Q = np.zeros((nbas, nbas))
+    for ish in range(nbas):
+        for jsh in range(ish, nbas):
+            eri = mol.intor('int2e', shls_slice=(
+                ish, ish + 1, jsh, jsh + 1, ish, ish + 1, jsh, jsh + 1))
+            Q[ish, jsh] = Q[jsh, ish] = np.sqrt(np.max(np.abs(eri)))
+    return Q
+
+
+def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10):
     """Build all primitive quartet tasks using numpy vectorization.
 
-    Replaces the 8-deep Python loop with vectorized operations.
-    Shell loop is still Python (unavoidable for variable nprim),
-    but primitive loops within each shell quartet are vectorized.
+    Includes Schwarz screening to skip negligible shell quartets.
     """
-    # Precompute per-shell data
     shell_l = np.array([mol.bas_angular(i) for i in range(nbas)])
     shell_atom = np.array([mol.bas_atom(i) for i in range(nbas)])
     atom_coords = np.array([mol.atom_coord(i) for i in range(mol.natm)])
-    shell_R = atom_coords[shell_atom]  # (nbas, 3)
+    shell_R = atom_coords[shell_atom]
     shell_i0 = np.array([ao_loc[i] for i in range(nbas)])
 
-    # Precompute exponents and coefficients per shell
     shell_exps = [mol.bas_exp(i) for i in range(nbas)]
     shell_coeffs = [mol._libcint_ctr_coeff(i).flatten() for i in range(nbas)]
 
-    all_tasks = []
+    # Schwarz screening bounds
+    Q = _schwarz_bounds(mol, nbas)
 
-    # Shell quartet loop (Python — nbas^4 iterations, typically ~300K for def2-TZVPP)
-    # But each iteration generates all primitive tasks vectorized
+    all_tasks = []
+    n_screened = 0
+    n_total = 0
+
     for ish in range(nbas):
         li = shell_l[ish]
         if li > 3: continue
@@ -429,6 +442,13 @@ def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l):
                 for lsh in range(nbas):
                     ll = shell_l[lsh]
                     if ll > 3: continue
+                    n_total += 1
+
+                    # Schwarz screening
+                    if Q[ish, jsh] * Q[ksh, lsh] < schwarz_thresh:
+                        n_screened += 1
+                        continue
+
                     Rl = shell_R[lsh]
                     al_arr = shell_exps[lsh]
                     cl_arr = shell_coeffs[lsh]
@@ -513,8 +533,8 @@ def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
     ao_loc = mol.ao_loc_nr()
     fac_l = {0: sqrt(1.0 / (4 * pi)), 1: sqrt(3.0 / (4 * pi))}
 
-    # --- Phase 1: vectorized task generation (no Python loops over primitives) ---
-    tasks = _build_tasks_vectorized(mol, ao_loc, nbas, fac_l)
+    # --- Phase 1: vectorized task generation with Schwarz screening ---
+    tasks = _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10)
 
     if len(tasks) == 0:
         return (np.zeros((nao, nao)) if with_j else None,
