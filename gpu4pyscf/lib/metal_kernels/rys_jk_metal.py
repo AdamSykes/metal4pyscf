@@ -291,9 +291,15 @@ def _rys_from_boys_batch(nroots, fm):
 
     elif nroots == 3:
         H = np.empty((N, 3, 3))
-        H[:, 0, 0] = fm[0]; H[:, 0, 1] = fm[1]; H[:, 0, 2] = fm[2]
-        H[:, 1, 0] = fm[1]; H[:, 1, 1] = fm[2]; H[:, 1, 2] = fm[3]
-        H[:, 2, 0] = fm[2]; H[:, 2, 1] = fm[3]; H[:, 2, 2] = fm[4]
+        H[:, 0, 0] = fm[0]
+        H[:, 0, 1] = fm[1]
+        H[:, 0, 2] = fm[2]
+        H[:, 1, 0] = fm[1]
+        H[:, 1, 1] = fm[2]
+        H[:, 1, 2] = fm[3]
+        H[:, 2, 0] = fm[2]
+        H[:, 2, 1] = fm[3]
+        H[:, 2, 2] = fm[4]
         rhs_h = np.stack([fm[3], fm[4], fm[5]], axis=1)
         dets = np.linalg.det(H)
         good = np.abs(dets) > 1e-30
@@ -619,11 +625,6 @@ def _cart2sph_eri(eri_cart, li, lj, lk, ll):
     return eri
 
 
-def _nsph(l):
-    """Number of spherical harmonics for angular momentum l."""
-    return int(_NSPH_LUT[l])
-
-
 @nb.njit(cache=True)
 def _sum_primitives_numba(eri_buf, task_eri_offsets,
                           q_starts, q_counts, ncarts, n_q):
@@ -658,9 +659,18 @@ def _accumulate_jk_numba(vj, vk, dm, eri_flat, eri_off,
     """Numba-compiled J/K accumulation with 8-fold symmetry unfolding."""
     n_q = len(q_i0)
     for q in range(n_q):
-        i0 = q_i0[q]; j0 = q_j0[q]; k0 = q_k0[q]; l0 = q_l0[q]
-        ni = q_ni[q]; nj = q_nj[q]; nk = q_nk[q]; nl = q_nl[q]
-        ish = q_ish[q]; jsh = q_jsh[q]; ksh = q_ksh[q]; lsh = q_lsh[q]
+        i0 = q_i0[q]
+        j0 = q_j0[q]
+        k0 = q_k0[q]
+        l0 = q_l0[q]
+        ni = q_ni[q]
+        nj = q_nj[q]
+        nk = q_nk[q]
+        nl = q_nl[q]
+        ish = q_ish[q]
+        jsh = q_jsh[q]
+        ksh = q_ksh[q]
+        lsh = q_lsh[q]
         ij = ish * (ish + 1) // 2 + jsh
         kl = ksh * (ksh + 1) // 2 + lsh
         off = eri_off[q]
@@ -845,8 +855,10 @@ def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
         for q_idx in range(n_q):
             qi = quartet_info[q_idx]
             q_meta[q_idx] = qi
-            q_li[q_idx] = qi[4]; q_lj[q_idx] = qi[5]
-            q_lk[q_idx] = qi[6]; q_ll[q_idx] = qi[7]
+            q_li[q_idx] = qi[4]
+            q_lj[q_idx] = qi[5]
+            q_lk[q_idx] = qi[6]
+            q_ll[q_idx] = qi[7]
         ncarts = (_NCART_LUT[q_li] * _NCART_LUT[q_lj]
                   * _NCART_LUT[q_lk] * _NCART_LUT[q_ll])
         nsphs = (_NSPH_LUT[q_li] * _NSPH_LUT[q_lj]
@@ -869,8 +881,10 @@ def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
             li, lj, lk, ll = int(q_li[q_idx]), int(q_lj[q_idx]), \
                               int(q_lk[q_idx]), int(q_ll[q_idx])
             nc = int(ncarts[q_idx])
-            ni_c = int(_NCART_LUT[li]); nj_c = int(_NCART_LUT[lj])
-            nk_c = int(_NCART_LUT[lk]); nl_c = int(_NCART_LUT[ll])
+            ni_c = int(_NCART_LUT[li])
+            nj_c = int(_NCART_LUT[lj])
+            nk_c = int(_NCART_LUT[lk])
+            nl_c = int(_NCART_LUT[ll])
             eri_cart = eri_summed[cart_off:cart_off + nc].reshape(
                 ni_c, nj_c, nk_c, nl_c)
             eri = _cart2sph_eri(eri_cart, li, lj, lk, ll)
