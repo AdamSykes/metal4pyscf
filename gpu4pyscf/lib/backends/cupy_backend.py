@@ -46,9 +46,9 @@ class DeviceManager:
         props = cupy.cuda.runtime.getDeviceProperties(device_id)
         # Normalise to a dict with consistent keys across backends
         return {
-            'name': props.get('name', b'CUDA device').decode()
-                    if isinstance(props.get('name'), bytes) else
-                    props.get('name', 'CUDA device'),
+            'name': (props.get('name', b'CUDA device').decode()
+                     if isinstance(props.get('name'), bytes)
+                     else props.get('name', 'CUDA device')),
             'total_memory': props['totalGlobalMem'],
             'shared_memory_per_block': props.get('sharedMemPerBlock', 0),
             'shared_memory_per_block_optin': props.get('sharedMemPerBlockOptin', 0),

@@ -14,7 +14,8 @@ class TestHessian:
         h_ref = mf_ref.Hessian().kernel()
 
         mf = RKS(h2o, xc='B3LYP').density_fit()
-        mf.verbose = 0; mf.kernel()
+        mf.verbose = 0
+        mf.kernel()
         h = mf.Hessian().kernel()
 
         assert np.max(np.abs(h - h_ref)) / np.max(np.abs(h_ref)) < 1e-5
@@ -22,7 +23,8 @@ class TestHessian:
     def test_frequencies(self, h2o):
         from gpu4pyscf.dft import RKS
         mf = RKS(h2o, xc='B3LYP').density_fit()
-        mf.verbose = 0; mf.kernel()
+        mf.verbose = 0
+        mf.kernel()
         h = mf.Hessian().kernel()
         freq = thermo.harmonic_analysis(h2o, h)['freq_wavenumber']
         # Should have 3 real vibrations for water

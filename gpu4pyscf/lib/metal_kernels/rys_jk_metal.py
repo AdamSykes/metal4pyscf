@@ -1,10 +1,19 @@
 """
 Metal GPU direct J/K engine via Rys polynomial quadrature.
 
-Phase 1 (CPU): enumerate primitive quartets, compute Rys roots/weights
-Phase 2 (Metal): TRR + HRR + ERI + J/K contraction (1 thread per primitive per root)
+Phase 1 (CPU f64): enumerate primitives, Boys function, Rys roots/weights
+Phase 2 (Metal f32): TRR + HRR + Cartesian ERI assembly per primitive
+Phase 3 (CPU f64): sum primitives per quartet, cart2sph, DM contraction
 
-Supports s/p/d/f shells (l=0,1,2,3).
+Rys roots/weights are computed on CPU in f64 (the f32 Hankel solve is
+numerically unstable for nroots>=3 at large t). The GPU kernel receives
+pre-computed roots/weights and only does the TRR/HRR recurrences,
+which are stable in f32.
+
+Each primitive gets its OWN output region — no atomic adds, fully
+deterministic. All accumulation happens in f64 on CPU.
+
+Supports s/p/d/f shells (l=0,1,2,3), nroots up to 3.
 """
 
 import numpy as np
@@ -14,17 +23,29 @@ from gpu4pyscf.lib.metal_kernels.eval_ao import _ncart, _cart2sph_matrix
 from gpu4pyscf.lib.metal_kernels.rys_jk import boys_function, _rys_from_boys
 
 # ---------------------------------------------------------------------------
-# Metal kernel: TRR + HRR + Cartesian ERI product + J/K atomic accumulation
+# Metal kernel: TRR + HRR + Cartesian ERI output
 #
-# Each thread handles one (primitive quartet, Rys root) pair.
-# Computes the 1D g-values for x,y,z, assembles the Cartesian ERI block,
-# and atomic-adds the J/K contributions.
-#
-# Template params: MAX_LIJ, MAX_LKL, MAX_NCART
-# These bound the array sizes for the g arrays and cart loops.
+# Each thread receives pre-computed Rys roots/weights from CPU (f64),
+# builds the 1D g-values via TRR+HRR, assembles Cartesian ERI block.
 # ---------------------------------------------------------------------------
 
-_RYS_JK_HEADER = '''
+# Task layout (TASK_STRIDE = 29 floats):
+#   [0]  aij
+#   [1]  akl
+#   [2:5]  PA (3 floats)
+#   [5:8]  QC (3 floats)
+#   [8:11] AB (3 floats)
+#   [11:14] CD (3 floats)
+#   [14] prefac
+#   [15:19] li, lj, lk, ll
+#   [19] eri_offset
+#   [20] nroots
+#   [21:24] roots (3 floats, padded with 0)
+#   [24:27] weights (3 floats, padded with 0)
+#   [27:30] Rpq (3 floats)
+TASK_STRIDE = 30
+
+_RYS_TRR_HEADER = '''
 constant int NCART[] = {1, 3, 6, 10};
 constant int CART_ALL[] = {
     0,
@@ -33,247 +54,92 @@ constant int CART_ALL[] = {
     48, 36, 33, 24, 21, 18, 12, 9, 6, 3
 };
 constant int CART_OFF[] = {0, 1, 4, 10};
-
-// erf approximation for Metal (Abramowitz & Stegun 7.1.26, max error 1.5e-7)
-inline float metal_erf(float x) {
-    float ax = abs(x);
-    float t = 1.0f / (1.0f + 0.3275911f * ax);
-    float poly = t * (0.254829592f + t * (-0.284496736f + t * (1.421413741f +
-                 t * (-1.453152027f + t * 1.061405429f))));
-    float result = 1.0f - poly * exp(-ax * ax);
-    return (x >= 0) ? result : -result;
-}
-
-// Boys function F_m(t) for m=0..max_m, in f32
-// 3 regimes matching CUDA gamma_inc.cu
-inline void boys_fn(thread float* f, float t, int m) {
-    if (t < 1e-7f) {
-        f[0] = 1.0f;
-        for (int i = 1; i <= m; i++)
-            f[i] = 1.0f / (2*i + 1);
-        return;
-    }
-    if (m > 0 && t < m * 0.5f + 0.5f) {
-        float bi = m + 0.5f;
-        float e = 0.5f * exp(-t);
-        float x = e, s = e;
-        for (int iter = 0; iter < 50 && x > 1e-7f * e; iter++) {
-            bi += 1.0f; x *= t / bi; s += x;
-        }
-        float b = m + 0.5f;
-        float fval = s / b;
-        f[m] = fval;
-        for (int i = m - 1; i >= 0; i--) {
-            b -= 1.0f;
-            fval = (e + t * fval) / b;
-            f[i] = fval;
-        }
-        return;
-    }
-    float tt = sqrt(t);
-    float fval = 0.886226925f / tt * metal_erf(tt); // sqrt(pi/4)/tt * erf(tt)
-    f[0] = fval;
-    if (m > 0) {
-        float e = 0.5f * exp(-t);
-        float b = 1.0f / t;
-        float b1 = 0.5f;
-        for (int i = 1; i <= m; i++) {
-            fval = b * (b1 * fval - e);
-            f[i] = fval;
-            b1 += 1.0f;
-        }
-    }
-}
-
-// Rys roots for nroots=1: root = F1/F0, weight = F0
-// Rys roots for nroots=2: Hankel 2x2 solve
-// Rys roots for nroots=3: Hankel 3x3 solve (simplified)
-inline void rys_roots_1(thread float* fm, thread float* roots, thread float* weights) {
-    weights[0] = fm[0];
-    roots[0] = (fm[0] > 1e-15f) ? fm[1] / fm[0] : 0.0f;
-}
-
-inline void rys_roots_2(thread float* fm, thread float* roots, thread float* weights) {
-    // Hankel 2x2: [F0 F1; F1 F2] @ c = [F2, F3]
-    float det = fm[0]*fm[2] - fm[1]*fm[1];
-    if (abs(det) < 1e-20f) {
-        float t = (fm[0] > 1e-15f) ? fm[1]/fm[0] : 0.0f;
-        roots[0] = roots[1] = t;
-        weights[0] = weights[1] = fm[0] * 0.5f;
-        return;
-    }
-    float c0 = (fm[2]*fm[2] - fm[1]*fm[3]) / det;
-    float c1 = (fm[0]*fm[3] - fm[1]*fm[2]) / det;
-    float disc = c1*c1 + 4*c0;
-    if (disc < 0) disc = 0;
-    float sq = sqrt(disc);
-    roots[0] = (c1 - sq) * 0.5f;
-    roots[1] = (c1 + sq) * 0.5f;
-    if (abs(roots[1] - roots[0]) < 1e-15f) {
-        weights[0] = weights[1] = fm[0] * 0.5f;
-    } else {
-        weights[1] = (fm[1] - fm[0]*roots[0]) / (roots[1] - roots[0]);
-        weights[0] = fm[0] - weights[1];
-    }
-}
-
-inline void rys_roots_3(thread float* fm, thread float* roots, thread float* weights) {
-    // Hankel 3x3 solve: simplified Cramer's rule
-    float H[3][3] = {{fm[0],fm[1],fm[2]},{fm[1],fm[2],fm[3]},{fm[2],fm[3],fm[4]}};
-    float rhs[3] = {fm[3], fm[4], fm[5]};
-    // Gaussian elimination
-    for (int col = 0; col < 3; col++) {
-        int pivot = col;
-        for (int row = col+1; row < 3; row++)
-            if (abs(H[row][col]) > abs(H[pivot][col])) pivot = row;
-        if (pivot != col) {
-            for (int j = 0; j < 3; j++) { float t=H[col][j]; H[col][j]=H[pivot][j]; H[pivot][j]=t; }
-            float t=rhs[col]; rhs[col]=rhs[pivot]; rhs[pivot]=t;
-        }
-        if (abs(H[col][col]) < 1e-20f) continue;
-        for (int row = col+1; row < 3; row++) {
-            float fac = H[row][col] / H[col][col];
-            for (int j = col; j < 3; j++) H[row][j] -= fac * H[col][j];
-            rhs[row] -= fac * rhs[col];
-        }
-    }
-    float c[3];
-    for (int i = 2; i >= 0; i--) {
-        float s = rhs[i];
-        for (int j = i+1; j < 3; j++) s -= H[i][j] * c[j];
-        c[i] = (abs(H[i][i]) > 1e-20f) ? s / H[i][i] : 0.0f;
-    }
-    // Roots of t^3 - c[2]*t^2 - c[1]*t - c[0] = 0
-    // Cardano's formula or Newton iteration
-    // Use Newton iteration from 3 initial guesses
-    float p = -c[2], q = -c[1], r = -c[0]; // t^3 + p*t^2 + q*t + r = 0
-    // Initial guesses spread in [0,1]
-    roots[0] = 0.1f; roots[1] = 0.4f; roots[2] = 0.8f;
-    for (int iter = 0; iter < 20; iter++) {
-        for (int k = 0; k < 3; k++) {
-            float t = roots[k];
-            float f = t*t*t + p*t*t + q*t + r;
-            float fp = 3*t*t + 2*p*t + q;
-            if (abs(fp) > 1e-15f) roots[k] -= f / fp;
-            roots[k] = clamp(roots[k], 0.0f, 1.0f);
-        }
-    }
-    // Sort
-    if (roots[0] > roots[1]) { float t=roots[0]; roots[0]=roots[1]; roots[1]=t; }
-    if (roots[1] > roots[2]) { float t=roots[1]; roots[1]=roots[2]; roots[2]=t; }
-    if (roots[0] > roots[1]) { float t=roots[0]; roots[0]=roots[1]; roots[1]=t; }
-    // Weights from Vandermonde
-    float V[3][3];
-    for (int i = 0; i < 3; i++) { V[i][0]=1; V[i][1]=roots[i]; V[i][2]=roots[i]*roots[i]; }
-    // Solve V^T @ w = fm[0:3] via Gaussian elimination
-    float VT[3][3]; for(int i=0;i<3;i++) for(int j=0;j<3;j++) VT[i][j]=V[j][i];
-    float wrhs[3] = {fm[0], fm[1], fm[2]};
-    for (int col = 0; col < 3; col++) {
-        int piv = col;
-        for (int row = col+1; row < 3; row++)
-            if (abs(VT[row][col]) > abs(VT[piv][col])) piv = row;
-        if (piv != col) {
-            for (int j=0;j<3;j++){float t=VT[col][j];VT[col][j]=VT[piv][j];VT[piv][j]=t;}
-            float t=wrhs[col]; wrhs[col]=wrhs[piv]; wrhs[piv]=t;
-        }
-        for (int row = col+1; row < 3; row++) {
-            float fac = VT[row][col] / (VT[col][col] + 1e-30f);
-            for (int j=col;j<3;j++) VT[row][j] -= fac*VT[col][j];
-            wrhs[row] -= fac*wrhs[col];
-        }
-    }
-    for (int i=2;i>=0;i--) {
-        float s=wrhs[i]; for(int j=i+1;j<3;j++) s-=VT[i][j]*weights[j];
-        weights[i] = s / (VT[i][i] + 1e-30f);
-    }
-}
 '''
 
-_RYS_JK_SOURCE = '''
+_RYS_TRR_SOURCE = '''
 uint tid = thread_position_in_grid.x;
 if (tid >= n_tasks) return;
 
-// Load task data: each task = one primitive quartet
-int task_off = tid * TASK_STRIDE;
-float aij   = task_data[task_off + 0];
-float akl   = task_data[task_off + 1];
-float PA_x  = task_data[task_off + 2];
-float PA_y  = task_data[task_off + 3];
-float PA_z  = task_data[task_off + 4];
-float QC_x  = task_data[task_off + 5];
-float QC_y  = task_data[task_off + 6];
-float QC_z  = task_data[task_off + 7];
-float AB_x  = task_data[task_off + 8];
-float AB_y  = task_data[task_off + 9];
-float AB_z  = task_data[task_off + 10];
-float CD_x  = task_data[task_off + 11];
-float CD_y  = task_data[task_off + 12];
-float CD_z  = task_data[task_off + 13];
-float Rpq_x = task_data[task_off + 14];
-float Rpq_y = task_data[task_off + 15];
-float Rpq_z = task_data[task_off + 16];
-float prefac = task_data[task_off + 17];
-int i0 = (int)task_data[task_off + 18];
-int j0 = (int)task_data[task_off + 19];
-int k0 = (int)task_data[task_off + 20];
-int l0 = (int)task_data[task_off + 21];
-int li = (int)task_data[task_off + 22];
-int lj = (int)task_data[task_off + 23];
-int lk = (int)task_data[task_off + 24];
-int ll = (int)task_data[task_off + 25];
+int off = tid * TASK_STRIDE;
+float aij    = task_data[off + 0];
+float akl    = task_data[off + 1];
+float PA_x   = task_data[off + 2];
+float PA_y   = task_data[off + 3];
+float PA_z   = task_data[off + 4];
+float QC_x   = task_data[off + 5];
+float QC_y   = task_data[off + 6];
+float QC_z   = task_data[off + 7];
+float AB_x   = task_data[off + 8];
+float AB_y   = task_data[off + 9];
+float AB_z   = task_data[off + 10];
+float CD_x   = task_data[off + 11];
+float CD_y   = task_data[off + 12];
+float CD_z   = task_data[off + 13];
+float prefac = task_data[off + 14];
+int li       = (int)task_data[off + 15];
+int lj       = (int)task_data[off + 16];
+int lk       = (int)task_data[off + 17];
+int ll       = (int)task_data[off + 18];
+int eri_off  = (int)task_data[off + 19];
+int nroots   = (int)task_data[off + 20];
+float rys_roots[3]   = {task_data[off+21], task_data[off+22], task_data[off+23]};
+float rys_weights[3] = {task_data[off+24], task_data[off+25], task_data[off+26]};
 
 int lij = li + lj;
 int lkl = lk + ll;
-int nroots = (li + lj + lk + ll) / 2 + 1;
 
-// Compute Boys function on GPU
-float theta = aij * akl / (aij + akl);
-float rr_pq = Rpq_x*Rpq_x + Rpq_y*Rpq_y + Rpq_z*Rpq_z;
-float x = theta * rr_pq;
-int m_max = max(li+lj+lk+ll, 2*nroots-1);
-float fm[14]; // max m_max = 13 for ffff
-boys_fn(fm, x, m_max);
+int ni = NCART[li], nj = NCART[lj], nk = NCART[lk], nl = NCART[ll];
+int ci_off = CART_OFF[li], cj_off = CART_OFF[lj];
+int ck_off = CART_OFF[lk], cl_off = CART_OFF[ll];
 
-// Compute Rys roots and weights on GPU
-float rys_roots[7], rys_weights[7]; // max nroots=7
-if (nroots == 1) rys_roots_1(fm, rys_roots, rys_weights);
-else if (nroots == 2) rys_roots_2(fm, rys_roots, rys_weights);
-else if (nroots == 3) rys_roots_3(fm, rys_roots, rys_weights);
-// nroots > 3 not yet supported in MSL
+// Zero this task's ERI region (MLX may reuse output buffers)
+int n_eri = ni * nj * nk * nl;
+for (int i = 0; i < n_eri; i++)
+    eri_out[eri_off + i] = 0.0f;
 
-// Loop over Rys roots
 for (int iroot = 0; iroot < nroots; iroot++) {
 float rt = rys_roots[iroot];
 float wt = rys_weights[iroot];
 
-// Rys-modified recurrence coefficients
-float rt_aa = rt / (aij + akl);
+float rt_aa  = rt / (aij + akl);
 float rt_aij = rt_aa * akl;
 float rt_akl = rt_aa * aij;
 float b10 = 0.5f / aij * (1.0f - rt_aij);
 float b01 = 0.5f / akl * (1.0f - rt_akl);
 float b00 = 0.5f * rt_aa;
 
-// TRR + HRR per direction, store final g[i,j,k,l] values
-// Max array: g[MAX_LIJ+1][MAX_LKL+1] for TRR
 float PA[3] = {PA_x, PA_y, PA_z};
 float QC[3] = {QC_x, QC_y, QC_z};
 float AB[3] = {AB_x, AB_y, AB_z};
 float CD[3] = {CD_x, CD_y, CD_z};
-float Rpq[3] = {Rpq_x, Rpq_y, Rpq_z};
+float Rpq[3] = {PA_x - QC_x + AB_x*0.0f, PA_y - QC_y, PA_z - QC_z};
 
-// g1d[dir][i][j][k][l] — stored flat
-// For MAX_LIJ=6, MAX_LKL=6: 7*7 = 49 per dir for TRR
-// After HRR: (li+1)*(lj+1)*(lk+1)*(ll+1) per dir
-float g1d_final[3][4][4][4][4]; // max 4 per index (f-shell l=3 → 4 values)
+float g1d_final[3][4][4][4][4];
 
 for (int dir = 0; dir < 3; dir++) {
-    float c0 = PA[dir] - rt_aij * Rpq[dir];
-    float cp = QC[dir] + rt_akl * Rpq[dir];
+    // Rys-modified recurrence centres
+    // P-A already in PA. Need Rpq = P - Q.
+    // We reconstruct Rpq from PA and QC:
+    //   Rpq = P - Q, PA = P - A, QC = Q - C
+    //   We need Rpq_dir for TRR, but it was removed from task data.
+    //   Actually Rpq is implicit: c0 = PA - rt_aij * Rpq, cp = QC + rt_akl * Rpq.
+    //   We need Rpq. But we removed it to save task stride.
+    //   Actually I can pass Rpq via the reserved slots!
+    // WORKAROUND: reconstruct from PA, QC, AB, CD
+    // P = A + PA, Q = C + QC
+    // A = arbitrary reference, C = arbitrary reference
+    // Rpq = P - Q = A + PA - C - QC
+    // But we don't have A or C separately!
+    // The correct approach: store Rpq in the task data.
 
-    // TRR: g[a, c] for a in [0,lij], c in [0,lkl]
-    float g[8][8]; // max 7+1 for lij+lkl up to 6+6... actually max lij=6 for ffff
-    // For f-shells: lij = li+lj <= 6, lkl <= 6
+    // Actually, we DO need Rpq. Let me use the reserved slots [27:30].
+    // For now, I'll read them from task_data:
+    float Rpq_dir = task_data[off + 27 + dir];  // Rpq stored at [27:30]
+
+    float c0 = PA[dir] - rt_aij * Rpq_dir;
+    float cp = QC[dir] + rt_akl * Rpq_dir;
+
+    float g[8][8];
     for (int a = 0; a <= lij; a++)
         for (int c = 0; c <= lkl; c++)
             g[a][c] = 0.0f;
@@ -291,8 +157,7 @@ for (int dir = 0; dir < 3; dir++) {
         }
     }
 
-    // HRR j-index: g_ij[i,j,c] from g[a,c]
-    float g_ij[8][4][8]; // [lij+1][lj+1][lkl+1]
+    float g_ij[8][4][8];
     for (int a = 0; a <= lij; a++)
         for (int c = 0; c <= lkl; c++)
             g_ij[a][0][c] = g[a][c];
@@ -301,8 +166,7 @@ for (int dir = 0; dir < 3; dir++) {
             for (int i = 0; i < lij-j; i++)
                 g_ij[i][j+1][c] = g_ij[i+1][j][c] + AB[dir] * g_ij[i][j][c];
 
-    // HRR l-index
-    float g_full[4][4][8][4]; // [li+1][lj+1][lkl+1][ll+1]
+    float g_full[4][4][8][4];
     for (int i = 0; i <= li; i++)
         for (int j = 0; j <= lj; j++) {
             for (int c = 0; c <= lkl; c++)
@@ -319,11 +183,6 @@ for (int dir = 0; dir < 3; dir++) {
                     g1d_final[dir][i][j][k][l] = g_full[i][j][k][l];
 }
 
-// Cartesian ERI assembly + J/K contraction
-int ni = NCART[li], nj = NCART[lj], nk = NCART[lk], nl = NCART[ll];
-int ci_off = CART_OFF[li], cj_off = CART_OFF[lj];
-int ck_off = CART_OFF[lk], cl_off = CART_OFF[ll];
-
 float pf_wt = prefac * wt;
 
 for (int ii = 0; ii < ni; ii++) {
@@ -332,8 +191,6 @@ for (int ii = 0; ii < ni; ii++) {
     for (int jj = 0; jj < nj; jj++) {
         int cj_v = CART_ALL[cj_off + jj];
         int ix_j = cj_v / 16, iy_j = (cj_v / 4) % 4, iz_j = cj_v % 4;
-
-        float j_contrib = 0.0f;
         for (int kk = 0; kk < nk; kk++) {
             int ck_v = CART_ALL[ck_off + kk];
             int ix_k = ck_v / 16, iy_k = (ck_v / 4) % 4, iz_k = ck_v % 4;
@@ -344,36 +201,27 @@ for (int ii = 0; ii < ni; ii++) {
                               * g1d_final[1][iy_i][iy_j][iy_k][iy_l]
                               * g1d_final[2][iz_i][iz_j][iz_k][iz_l]
                               * pf_wt;
-                j_contrib += eri_val * dm[(k0+kk)*nao + (l0+ll_idx)];
-
-                // K contribution: K[i,k] += ERI[i,j,k,l] * DM[j,l]
-                float k_val = eri_val * dm[(j0+jj)*nao + (l0+ll_idx)];
-                atomic_fetch_add_explicit(&vk[(i0+ii)*nao + (k0+kk)], k_val, memory_order_relaxed);
+                int idx = eri_off + ((ii * nj + jj) * nk + kk) * nl + ll_idx;
+                eri_out[idx] += eri_val;
             }
         }
-        atomic_fetch_add_explicit(&vj[(i0+ii)*nao + (j0+jj)], j_contrib, memory_order_relaxed);
     }
 }
 } // end root loop
 '''
 
-_rys_jk_kernel = mx.fast.metal_kernel(
-    name='rys_jk_direct',
-    input_names=['task_data', 'dm'],
-    output_names=['vj', 'vk'],
-    header=_RYS_JK_HEADER,
-    source=_RYS_JK_SOURCE,
-    atomic_outputs=True,
+_rys_eri_kernel = mx.fast.metal_kernel(
+    name='rys_trr_eri',
+    input_names=['task_data'],
+    output_names=['eri_out'],
+    header=_RYS_TRR_HEADER,
+    source=_RYS_TRR_SOURCE,
+    atomic_outputs=False,
 )
-
-TASK_STRIDE = 26  # floats per task (no roots/weights — computed on GPU)
 
 
 def _schwarz_bounds(mol, nbas):
-    """Precompute Schwarz screening bounds Q[ish,jsh] = sqrt(max|(ij|ij)|).
-
-    Used to skip shell quartets where Q_ij * Q_kl < threshold.
-    """
+    """Precompute Schwarz screening bounds Q[ish,jsh] = sqrt(max|(ij|ij)|)."""
     Q = np.zeros((nbas, nbas))
     for ish in range(nbas):
         for jsh in range(ish, nbas):
@@ -383,10 +231,16 @@ def _schwarz_bounds(mol, nbas):
     return Q
 
 
-def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10):
-    """Build all primitive quartet tasks using numpy vectorization.
+def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10,
+                            max_nroots=3):
+    """Build per-primitive tasks with CPU-computed Rys roots/weights.
 
-    Includes Schwarz screening to skip negligible shell quartets.
+    Returns:
+        tasks: (N, TASK_STRIDE) float32 array for GPU
+        task_quartet_idx: (N,) int array mapping task → quartet
+        quartet_info: list of (i0, j0, k0, l0, li, lj, lk, ll) tuples
+        total_eri_size: total floats in the ERI output buffer
+        cpu_quartets: shell quartets needing nroots > max_nroots
     """
     shell_l = np.array([mol.bas_angular(i) for i in range(nbas)])
     shell_atom = np.array([mol.bas_atom(i) for i in range(nbas)])
@@ -397,12 +251,13 @@ def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10):
     shell_exps = [mol.bas_exp(i) for i in range(nbas)]
     shell_coeffs = [mol._libcint_ctr_coeff(i).flatten() for i in range(nbas)]
 
-    # Schwarz screening bounds
     Q = _schwarz_bounds(mol, nbas)
 
     all_tasks = []
-    n_screened = 0
-    n_total = 0
+    all_quartet_idx = []
+    quartet_info = []
+    cpu_quartets = []
+    eri_offset = 0
 
     for ish in range(nbas):
         li = shell_l[ish]
@@ -420,15 +275,14 @@ def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10):
             rr_ij = np.dot(Ri - Rj, Ri - Rj)
             AB = Ri - Rj
 
-            # Vectorize over ij primitives
-            ni, nj = len(ai_arr), len(aj_arr)
-            ai_2d = np.repeat(ai_arr, nj)      # (ni*nj,)
-            aj_2d = np.tile(aj_arr, ni)
-            ci_2d = np.repeat(ci_arr, nj)
-            cj_2d = np.tile(cj_arr, ni)
+            ni_p, nj_p = len(ai_arr), len(aj_arr)
+            ai_2d = np.repeat(ai_arr, nj_p)
+            aj_2d = np.tile(aj_arr, ni_p)
+            ci_2d = np.repeat(ci_arr, nj_p)
+            cj_2d = np.tile(cj_arr, ni_p)
             aij = ai_2d + aj_2d
             Kab = np.exp(-ai_2d * aj_2d / aij * rr_ij)
-            Pij = (ai_2d[:, None] * Ri + aj_2d[:, None] * Rj) / aij[:, None]  # (ni*nj, 3)
+            Pij = (ai_2d[:, None] * Ri + aj_2d[:, None] * Rj) / aij[:, None]
             PA = Pij - Ri
             cicj_Kab = ci_2d * cj_2d * Kab
 
@@ -442,11 +296,13 @@ def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10):
                 for lsh in range(nbas):
                     ll = shell_l[lsh]
                     if ll > 3: continue
-                    n_total += 1
 
-                    # Schwarz screening
                     if Q[ish, jsh] * Q[ksh, lsh] < schwarz_thresh:
-                        n_screened += 1
+                        continue
+
+                    nroots = (li + lj + lk + ll) // 2 + 1
+                    if nroots > max_nroots:
+                        cpu_quartets.append((ish, jsh, ksh, lsh))
                         continue
 
                     Rl = shell_R[lsh]
@@ -455,32 +311,28 @@ def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10):
                     rr_kl = np.dot(Rk - Rl, Rk - Rl)
                     CD = Rk - Rl
 
-                    # Vectorize over kl primitives
-                    nk, nl = len(ak_arr), len(al_arr)
-                    ak_2d = np.repeat(ak_arr, nl)
-                    al_2d = np.tile(al_arr, nk)
-                    ck_2d = np.repeat(ck_arr, nl)
-                    cl_2d = np.tile(cl_arr, nk)
+                    nk_p, nl_p = len(ak_arr), len(al_arr)
+                    ak_2d = np.repeat(ak_arr, nl_p)
+                    al_2d = np.tile(al_arr, nk_p)
+                    ck_2d = np.repeat(ck_arr, nl_p)
+                    cl_2d = np.tile(cl_arr, nk_p)
                     akl = ak_2d + al_2d
                     Kcd = np.exp(-ak_2d * al_2d / akl * rr_kl)
                     Pkl = (ak_2d[:, None] * Rk + al_2d[:, None] * Rl) / akl[:, None]
-                    QC = Pkl - Rk
+                    QC_arr = Pkl - Rk
                     ckcl_Kcd = ck_2d * cl_2d * Kcd
 
-                    # Cross-product: all (ij, kl) combinations
-                    n_ij = ni * nj
-                    n_kl = nk * nl
-                    # Expand to (n_ij * n_kl) tasks
+                    n_ij = ni_p * nj_p
+                    n_kl = nk_p * nl_p
                     aij_all = np.repeat(aij, n_kl)
                     akl_all = np.tile(akl, n_ij)
                     PA_all = np.repeat(PA, n_kl, axis=0)
-                    QC_all = np.tile(QC, (n_ij, 1))
+                    QC_all = np.tile(QC_arr, (n_ij, 1))
                     Pij_all = np.repeat(Pij, n_kl, axis=0)
                     Pkl_all = np.tile(Pkl, (n_ij, 1))
                     Rpq_all = Pij_all - Pkl_all
                     coeff_all = np.repeat(cicj_Kab, n_kl) * np.tile(ckcl_Kcd, n_ij)
 
-                    # Screening
                     mask = np.abs(coeff_all) > 1e-14
                     if not np.any(mask):
                         continue
@@ -496,36 +348,96 @@ def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10):
                     fac = fac_l.get(li, 1.0) * fac_l.get(lj, 1.0) * fac_l.get(lk, 1.0) * fac_l.get(ll, 1.0)
                     prefac *= fac
 
+                    # Compute Rys roots/weights on CPU in f64
+                    theta = aij_m * akl_m / (aij_m + akl_m)
+                    rr_pq = np.sum(Rpq_m**2, axis=1)
+                    t_vals = theta * rr_pq
+                    m_max = max(li + lj + lk + ll, 2 * nroots - 1)
+                    fm_all = boys_function(m_max, t_vals)  # (m_max+1, ntasks)
+
                     ntasks = len(prefac)
+                    roots_arr = np.zeros((ntasks, 3), dtype=np.float64)
+                    weights_arr = np.zeros((ntasks, 3), dtype=np.float64)
+                    for t_idx in range(ntasks):
+                        rt, wt = _rys_from_boys(nroots, fm_all[:, t_idx])
+                        roots_arr[t_idx, :nroots] = rt
+                        weights_arr[t_idx, :nroots] = wt
+
+                    ncart = _ncart(li) * _ncart(lj) * _ncart(lk) * _ncart(ll)
+                    q_idx = len(quartet_info)
+                    quartet_info.append((
+                        shell_i0[ish], shell_i0[jsh],
+                        shell_i0[ksh], shell_i0[lsh],
+                        li, lj, lk, ll,
+                    ))
+
                     block = np.zeros((ntasks, TASK_STRIDE), dtype=np.float32)
                     block[:, 0] = aij_m
                     block[:, 1] = akl_m
                     block[:, 2:5] = PA_m
                     block[:, 5:8] = QC_m
-                    block[:, 8] = AB[0]; block[:, 9] = AB[1]; block[:, 10] = AB[2]
-                    block[:, 11] = CD[0]; block[:, 12] = CD[1]; block[:, 13] = CD[2]
-                    block[:, 14:17] = Rpq_m
-                    block[:, 17] = prefac
-                    block[:, 18] = shell_i0[ish]
-                    block[:, 19] = shell_i0[jsh]
-                    block[:, 20] = shell_i0[ksh]
-                    block[:, 21] = shell_i0[lsh]
-                    block[:, 22] = li
-                    block[:, 23] = lj
-                    block[:, 24] = lk
-                    block[:, 25] = ll
+                    block[:, 8] = AB[0]
+                    block[:, 9] = AB[1]
+                    block[:, 10] = AB[2]
+                    block[:, 11] = CD[0]
+                    block[:, 12] = CD[1]
+                    block[:, 13] = CD[2]
+                    block[:, 14] = prefac
+                    block[:, 15] = li
+                    block[:, 16] = lj
+                    block[:, 17] = lk
+                    block[:, 18] = ll
+                    block[:, 19] = np.arange(ntasks) * ncart + eri_offset
+                    block[:, 20] = nroots
+                    block[:, 21:24] = roots_arr.astype(np.float32)
+                    block[:, 24:27] = weights_arr.astype(np.float32)
+                    block[:, 27:30] = Rpq_m.astype(np.float32)  # Rpq for TRR
                     all_tasks.append(block)
+                    all_quartet_idx.append(np.full(ntasks, q_idx, dtype=np.int32))
+
+                    eri_offset += ntasks * ncart
 
     if all_tasks:
-        return np.concatenate(all_tasks, axis=0)
-    return np.zeros((0, TASK_STRIDE), dtype=np.float32)
+        tasks = np.concatenate(all_tasks, axis=0)
+        task_qidx = np.concatenate(all_quartet_idx)
+    else:
+        tasks = np.zeros((0, TASK_STRIDE), dtype=np.float32)
+        task_qidx = np.zeros(0, dtype=np.int32)
+    return tasks, task_qidx, quartet_info, eri_offset, cpu_quartets
+
+
+def _cart2sph_eri(eri_cart, li, lj, lk, ll):
+    """Transform a Cartesian ERI block to spherical harmonics.
+
+    _cart2sph_matrix(l) returns shape (ncart, nsph).
+    """
+    eri = eri_cart
+    if li >= 2:
+        c2s = _cart2sph_matrix(li)          # (ncart_i, nsph_i)
+        eri = np.einsum('ip,ijkl->pjkl', c2s, eri)
+    if lj >= 2:
+        c2s = _cart2sph_matrix(lj)
+        eri = np.einsum('jq,pjkl->pqkl', c2s, eri)
+    if lk >= 2:
+        c2s = _cart2sph_matrix(lk)
+        eri = np.einsum('kr,pqkl->pqrl', c2s, eri)
+    if ll >= 2:
+        c2s = _cart2sph_matrix(ll)
+        eri = np.einsum('ls,pqrl->pqrs', c2s, eri)
+    return eri
+
+
+def _nsph(l):
+    """Number of spherical harmonics for angular momentum l."""
+    return 2 * l + 1 if l >= 2 else _ncart(l)
 
 
 def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
-    """Direct J/K on Metal GPU via Rys quadrature.
+    """Direct J/K via Rys quadrature: f64 roots + f32 GPU TRR + f64 accumulation.
 
-    CPU: enumerates primitive quartets, computes Rys roots/weights.
-    GPU: TRR + HRR + ERI + J/K contraction in parallel.
+    Phase 1 (CPU f64): primitives, Boys function, Rys roots/weights
+    Phase 2 (Metal f32): TRR + HRR + per-primitive Cartesian ERI
+    Phase 3 (CPU f64): sum primitives per quartet, cart2sph, DM contraction
     """
     nao = mol.nao
     dm = np.asarray(dm, dtype=np.float64)
@@ -533,35 +445,96 @@ def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
     ao_loc = mol.ao_loc_nr()
     fac_l = {0: sqrt(1.0 / (4 * pi)), 1: sqrt(3.0 / (4 * pi))}
 
-    # --- Phase 1: vectorized task generation with Schwarz screening ---
-    tasks = _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10)
+    tasks, task_qidx, quartet_info, total_eri_size, cpu_quartets = \
+        _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10)
 
-    if len(tasks) == 0:
-        return (np.zeros((nao, nao)) if with_j else None,
-                np.zeros((nao, nao)) if with_k else None)
+    vj = np.zeros((nao, nao), dtype=np.float64) if with_j else None
+    vk = np.zeros((nao, nao), dtype=np.float64) if with_k else None
 
-    # --- Phase 2: Metal GPU kernel ---
-    task_array = mx.array(tasks.ravel())
-    dm_gpu = mx.array(dm.astype(np.float32).ravel())
-    n_tasks = tasks.shape[0]
+    # Phase 2: Metal GPU kernel for nroots<=3 tasks
+    if len(tasks) > 0:
+        if total_eri_size == 0:
+            total_eri_size = 1
 
-    THREADS = 256
-    grid_size = ((n_tasks + THREADS - 1) // THREADS) * THREADS
+        task_gpu = mx.array(tasks.ravel())
+        n_tasks = tasks.shape[0]
 
-    result = _rys_jk_kernel(
-        inputs=[task_array, dm_gpu],
-        grid=(grid_size, 1, 1),
-        threadgroup=(THREADS, 1, 1),
-        output_shapes=[(nao * nao,), (nao * nao,)],
-        output_dtypes=[mx.float32, mx.float32],
-        template=[('n_tasks', n_tasks), ('TASK_STRIDE', TASK_STRIDE), ('nao', nao)],
-    )
-    mx.eval(result[0], result[1])
+        THREADS = 256
+        grid_size = ((n_tasks + THREADS - 1) // THREADS) * THREADS
 
-    vj = np.array(result[0]).astype(np.float64).reshape(nao, nao) if with_j else None
-    vk = np.array(result[1]).astype(np.float64).reshape(nao, nao) if with_k else None
+        result = _rys_eri_kernel(
+            inputs=[task_gpu],
+            grid=(grid_size, 1, 1),
+            threadgroup=(THREADS, 1, 1),
+            output_shapes=[(total_eri_size,)],
+            output_dtypes=[mx.float32],
+            template=[('n_tasks', n_tasks), ('TASK_STRIDE', TASK_STRIDE)],
+        )
+        mx.eval(result[0])
 
-    # Cart → spherical transformation on the accumulated J/K
-    # (The kernel works in the spherical AO basis since ao_loc gives spherical indices)
+        eri_buf = np.array(result[0]).astype(np.float64)
+
+        # Phase 3a: CPU f64 accumulation for GPU quartets
+        task_eri_offsets = tasks[:, 19].astype(np.int64)
+
+        for q_idx in range(len(quartet_info)):
+            i0, j0, k0, l0, li, lj, lk, ll = quartet_info[q_idx]
+            ni_c = _ncart(li)
+            nj_c = _ncart(lj)
+            nk_c = _ncart(lk)
+            nl_c = _ncart(ll)
+            ncart = ni_c * nj_c * nk_c * nl_c
+
+            task_mask = task_qidx == q_idx
+            offsets = task_eri_offsets[task_mask]
+
+            eri_sum = np.zeros(ncart, dtype=np.float64)
+            for off in offsets:
+                eri_sum += eri_buf[off:off + ncart]
+
+            eri_cart = eri_sum.reshape(ni_c, nj_c, nk_c, nl_c)
+            eri = _cart2sph_eri(eri_cart, li, lj, lk, ll)
+
+            ni_s = _nsph(li)
+            nj_s = _nsph(lj)
+            nk_s = _nsph(lk)
+            nl_s = _nsph(ll)
+
+            if with_j:
+                dm_kl = dm[k0:k0+nk_s, l0:l0+nl_s]
+                vj[i0:i0+ni_s, j0:j0+nj_s] += np.einsum('kl,ijkl->ij', dm_kl, eri)
+            if with_k:
+                dm_jl = dm[j0:j0+nj_s, l0:l0+nl_s]
+                vk[i0:i0+ni_s, k0:k0+nk_s] += np.einsum('jl,ijkl->ik', dm_jl, eri)
+
+    # Phase 3b: CPU fallback for nroots > max_nroots
+    if cpu_quartets:
+        _accumulate_cpu_quartets(mol, dm, ao_loc, cpu_quartets,
+                                 vj, vk, with_j, with_k)
 
     return vj, vk
+
+
+def _accumulate_cpu_quartets(mol, dm, ao_loc, cpu_quartets,
+                             vj, vk, with_j, with_k):
+    """Compute ERIs via PySCF libcint for shell quartets needing nroots > 3."""
+    for (ish, jsh, ksh, lsh) in cpu_quartets:
+        eri = mol.intor('int2e', shls_slice=(
+            ish, ish + 1, jsh, jsh + 1, ksh, ksh + 1, lsh, lsh + 1))
+
+        i0 = ao_loc[ish]
+        j0 = ao_loc[jsh]
+        k0 = ao_loc[ksh]
+        l0 = ao_loc[lsh]
+        ni = ao_loc[ish + 1] - i0
+        nj = ao_loc[jsh + 1] - j0
+        nk = ao_loc[ksh + 1] - k0
+        nl = ao_loc[lsh + 1] - l0
+        eri = eri.reshape(ni, nj, nk, nl)
+
+        if with_j:
+            dm_kl = dm[k0:k0+nk, l0:l0+nl]
+            vj[i0:i0+ni, j0:j0+nj] += np.einsum('kl,ijkl->ij', dm_kl, eri)
+        if with_k:
+            dm_jl = dm[j0:j0+nj, l0:l0+nl]
+            vk[i0:i0+ni, k0:k0+nk] += np.einsum('jl,ijkl->ik', dm_jl, eri)

@@ -298,7 +298,8 @@ def _rys_build_eri(eri, prefac, fm, ai, aj, ak, al, aij, akl,
         def _dfact(n):
             r = 1
             while n > 0:
-                r *= n; n -= 2
+                r *= n
+                n -= 2
             return r
         return 1.0 / sqrt(float(_dfact(2*lx-1) * _dfact(2*ly-1) * _dfact(2*lz-1)))
 

@@ -50,9 +50,14 @@ class DeviceManager:
         return 0
 
     class _NoopCtx:
-        def __init__(self, device_id): pass
-        def __enter__(self): return self
-        def __exit__(self, *a): pass
+        def __init__(self, device_id):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
 
     def set_device(self, device_id):
         return self._NoopCtx(device_id)
@@ -101,7 +106,8 @@ memory_manager = MemoryManager()
 
 class _NoopStream:
     ptr = 0
-    def synchronize(self): pass
+    def synchronize(self):
+        pass
 
 class StreamManager:
     _default = _NoopStream()

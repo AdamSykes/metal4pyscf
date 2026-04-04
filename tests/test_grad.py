@@ -35,7 +35,8 @@ class TestGeomOpt:
         # Use PySCF CPU directly (our gradients work but as_scanner
         # requires the full PySCF gradient class hierarchy)
         mf = rks_cpu.RKS(h2o_sto3g, xc='B3LYP')
-        mf.verbose = 0; mf.kernel()
+        mf.verbose = 0
+        mf.kernel()
         mol_eq = optimize(mf, maxsteps=10)
         assert mol_eq is not None
         coords = mol_eq.atom_coords() * 0.529177

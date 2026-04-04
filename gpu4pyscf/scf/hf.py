@@ -51,7 +51,7 @@ from . import dispersion
 # ---------------------------------------------------------------------------
 
 if BACKEND_NAME != 'cupy':
-    def eigh(a, b=None, overwrite=False):
+    def eigh(a, b=None, overwrite=False):  # noqa: F811
         """Eigendecomposition via SciPy. Returns numpy arrays."""
         import scipy.linalg
         a_np = np.asarray(to_host(a)) if is_device_array(a) else np.asarray(a)
@@ -60,7 +60,7 @@ if BACKEND_NAME != 'cupy':
             return scipy.linalg.eigh(a_np, b_np)
         return scipy.linalg.eigh(a_np)
 
-    def tag_array(a, **kwargs):
+    def tag_array(a, **kwargs):  # noqa: F811
         """Attach metadata to an array. On non-CuPy backends, use PySCF's
         NPArrayWithTag for numpy arrays or a simple wrapper for device arrays."""
         a_np = to_host(a) if is_device_array(a) else np.asarray(a)
@@ -71,38 +71,38 @@ if BACKEND_NAME != 'cupy':
         # Keep as numpy — the SCF loop will call to_device where needed
         return t
 
-    def return_cupy_array(fn):
+    def return_cupy_array(fn):  # noqa: F811
         """On non-CuPy backends, just return numpy arrays as-is."""
         return fn
 
-    def cond(a, **kwargs):
+    def cond(a, **kwargs):  # noqa: F811
         a_np = to_host(a) if is_device_array(a) else np.asarray(a)
         return np.linalg.cond(a_np)
 
-    def asarray(a, **kwargs):
+    def asarray(a, **kwargs):  # noqa: F811
         if isinstance(a, np.ndarray):
             return a
         if is_device_array(a):
             return to_host(a)
         return np.asarray(a)
 
-    def get_avail_mem():
+    def get_avail_mem():  # noqa: F811
         free, total = __import__('gpu4pyscf.lib.backend', fromlist=['memory']).memory.get_mem_info()
         return free
 
-    def block_diag(blocks, out=None):
+    def block_diag(blocks, out=None):  # noqa: F811
         import scipy.linalg
         np_blocks = [to_host(b) if is_device_array(b) else np.asarray(b) for b in blocks]
         return scipy.linalg.block_diag(*np_blocks)
 
-    def sandwich_dot(a, c, out=None):
+    def sandwich_dot(a, c, out=None):  # noqa: F811
         a_np = to_host(a) if is_device_array(a) else np.asarray(a)
         c_np = to_host(c) if is_device_array(c) else np.asarray(c)
         if a_np.ndim == 2:
             return c_np.T @ a_np @ c_np
         return np.einsum('...ij,ip,jq->...pq', a_np, c_np.conj(), c_np)
 
-    def stack_with_padding(arrays):
+    def stack_with_padding(arrays):  # noqa: F811
         if not arrays:
             raise ValueError("arrays must be a non-empty sequence")
         max_nmo = max(a.shape[1] for a in arrays)
@@ -116,7 +116,7 @@ if BACKEND_NAME != 'cupy':
                 out[k,:,nmo:] = 0
         return out
 
-    def smearing(mf, *args, **kwargs):
+    def smearing(mf, *args, **kwargs):  # noqa: F811
         raise NotImplementedError(
             'Smearing is not yet available on the %s backend' % BACKEND_NAME)
 
@@ -135,7 +135,8 @@ def _patch_df_with_metal_jk(mf_df):
     _spec = _ilu.spec_from_file_location(
         'gpu4pyscf.df.df_jk_metal',
         _os.path.join(_os.path.dirname(__file__), '..', 'df', 'df_jk_metal.py'))
-    _mod = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_mod)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
     get_jk_metal, clear_cache = _mod.get_jk_metal, _mod.clear_cache
     dfobj = mf_df.with_df
     _original_get_jk = dfobj.get_jk
@@ -243,17 +244,22 @@ if BACKEND_NAME == 'cupy':
 else:
     def get_jk(mol, dm, hermi=1, vhfopt=None, with_j=True, with_k=True, omega=None,
                verbose=None):
-        '''Compute J, K matrices using PySCF CPU engine.
+        '''Compute J, K matrices.
 
-        The Metal Rys GPU engine is available via get_jk_rys_metal() for
-        direct use, but PySCF's C engine is used for SCF convergence
-        stability (f32 Rys J/K causes DIIS instability at tight thresholds).
-        For GPU-accelerated J/K, use density_fit() which routes through
-        the Metal DF-J/K engine.
+        On MLX backend: Metal GPU Rys engine (f64 roots + f32 TRR + f64 accumulation).
+        On NumPy backend: PySCF CPU engine (f64 throughout).
         '''
         dm_np = np.asarray(dm)
-        with mol.with_range_coulomb(omega):
-            vj, vk = hf_cpu.get_jk(mol, dm_np, hermi, None, with_j, with_k, omega)
+        if omega and omega != 0:
+            # Range-separated Coulomb: use CPU engine
+            with mol.with_range_coulomb(omega):
+                vj, vk = hf_cpu.get_jk(mol, dm_np, hermi, None, with_j, with_k, omega)
+            return np.asarray(vj), np.asarray(vk)
+        if BACKEND_NAME == 'mlx':
+            from gpu4pyscf.lib.metal_kernels.rys_jk_metal import get_jk_rys_metal
+            return get_jk_rys_metal(mol, dm_np, with_j=with_j, with_k=with_k)
+        # NumPy backend — PySCF CPU engine
+        vj, vk = hf_cpu.get_jk(mol, dm_np, hermi, None, with_j, with_k, omega)
         return np.asarray(vj), np.asarray(vk)
 
     def _get_jk(mf, mol, dm=None, hermi=1, with_j=True, with_k=True, omega=None):

@@ -15,7 +15,8 @@ class TestPCM:
 
         mf = RKS(h2o, xc='B3LYP').PCM()
         mf.with_solvent.method = method
-        mf.verbose = 0; mf.kernel()
+        mf.verbose = 0
+        mf.kernel()
 
         assert abs(mf.e_tot - mf_ref.e_tot) < 1e-8
 
@@ -28,7 +29,8 @@ class TestPCM:
 
         mf = RKS(h2o, xc='B3LYP').PCM()
         mf.with_solvent.method = 'C-PCM'
-        mf.verbose = 0; mf.kernel()
+        mf.verbose = 0
+        mf.kernel()
         g = mf.nuc_grad_method().kernel()
 
         assert np.linalg.norm(g - g_ref) < 1e-5

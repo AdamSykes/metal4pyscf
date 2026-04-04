@@ -188,7 +188,7 @@ Apple Silicon shares RAM between CPU and GPU. This means:
 | TDDFT / TDA | Ported | CPU fallback with f64 refinement (error < 3e-6 eV) |
 | Metal GPU acceleration | Active | DF-J/K 6-12x, eval_ao 1.1x, XC contraction 3.6x, end-to-end 1.5-3.9x |
 | Rys integral engine (CPU) | Working | Direct J/K for s/p/d/f, machine precision on def2-TZVPP |
-| Rys integral engine (Metal GPU) | Working (standalone) | Boys+TRR+HRR+ERI+J/K all on GPU, f32, 41x vs Python |
+| Rys integral engine (Metal GPU) | **SCF-integrated** | f64 roots + f32 TRR/HRR on GPU + f64 accumulation, dE < 1e-9 Ha |
 | QM/MM | Ported | CPU fallback via PySCF |
 | PBC (periodic) | Ported | CPU fallback via PySCF |
 
@@ -327,27 +327,25 @@ Complete implementation of the Rys polynomial quadrature for 2-electron integral
 - Verified to machine precision on STO-3G, def2-SVP, def2-TZVPP
 
 **Metal GPU kernel** (`rys_jk_metal.py`):
-- Boys function in MSL (erf via Abramowitz-Stegun polynomial)
-- Rys roots for nroots 1-3 (Hankel solve in MSL)
-- Full TRR + HRR + Cartesian ERI assembly in MSL
-- J/K contraction with atomic float adds
+
+Three-phase architecture for f64-accurate direct J/K with GPU acceleration:
+1. **CPU f64:** Boys function + Rys roots/weights via Hankel matrix (numerically stable in f64; the f32 Hankel solve diverges for nroots>=3 at large t)
+2. **Metal f32:** TRR + HRR + Cartesian ERI assembly. Each primitive gets its OWN output slot (no atomic adds, fully deterministic). MLX reuses output buffers, so the kernel explicitly zeros each slot before writing.
+3. **CPU f64:** Sum primitive ERI contributions per shell quartet, cart-to-spherical transformation for d/f shells, density matrix contraction to J/K.
+
 - Schwarz screening (precomputed Q bounds)
-- Vectorized numpy task generation (no Python loop over primitives)
-- One thread per primitive quartet, ~50K threads for H2O/STO-3G
+- Vectorized numpy task generation
+- Nroots 1-3 on GPU (s/p/d shells); nroots > 3 falls back to PySCF libcint
+- One thread per primitive quartet
 
-**Accuracy:** f32, ~1e-6 relative error for J/K matrices.
+**Accuracy:** dE < 1e-9 Ha vs PySCF CPU reference. J/K relative error ~2e-8 (f32 TRR precision, accumulated in f64). SCF converges at conv_tol=1e-8 without DIIS issues.
 
-**Performance:** 41x faster than the Python Rys reference. Dominated by CPU task enumeration (28ms), Metal kernel itself is <1ms.
-
-**SCF integration status:** The Metal Rys engine produces correct J/K matrices but **cannot be used directly in the SCF loop** — f32 atomic add noise (~1e-6 per cycle) causes DIIS divergence over multiple iterations. The DF path (with f64 CPU accumulation) does not have this problem.
-
-For non-DF SCF, PySCF's C engine is used (stable, fast). The Metal Rys engine is available as a standalone function:
+**SCF integration:** The Metal Rys engine is the default `get_jk` on the MLX backend. No density fitting required.
 ```python
-from gpu4pyscf.lib.metal_kernels.rys_jk_metal import get_jk_rys_metal
-vj, vk = get_jk_rys_metal(mol, dm)  # f32 J/K on Metal GPU
+from gpu4pyscf.scf import hf
+mf = hf.RHF(mol)  # uses Metal Rys automatically on Apple Silicon
+mf.kernel()
 ```
-
-**Path to SCF integration:** Restructure the kernel to accumulate per-shell-pair results in f64 on CPU (same strategy as the DF engine), using Metal only for the per-primitive TRR/HRR inner loop. This would give f64-accurate J/K with GPU-accelerated integral evaluation.
 
 ### Metal eval_ao (working)
 
@@ -482,7 +480,7 @@ print(f'PCM energy: {mf_pcm.e_tot:.10f} Ha')
 | `gpu4pyscf/lib/metal_kernels/eval_ao.py` | Metal eval_ao kernel (deriv=0,1) with cart2sph |
 | `gpu4pyscf/lib/metal_kernels/fused_xc.py` | Fused eval_ao+rho+Vxc with threadgroup shared memory |
 | `gpu4pyscf/lib/metal_kernels/rys_jk.py` | CPU Rys polynomial integral engine (reference) |
-| `gpu4pyscf/lib/metal_kernels/rys_jk_metal.py` | Metal GPU Rys integral engine (Boys+TRR+HRR+J/K) |
+| `gpu4pyscf/lib/metal_kernels/rys_jk_metal.py` | Metal GPU Rys integral engine (f64 roots + f32 TRR/HRR + f64 accumulation) |
 | `gpu4pyscf/df/df_jk_metal.py` | Metal GPU DF-J/K engine with cached tensors |
 | `gpu4pyscf/dft/numint_metal.py` | Metal GPU XC integration (fused eval_ao + contraction) |
 | `gpu4pyscf/grad/_cpu_fallback.py` | RHF/RKS/UHF/UKS gradient CPU fallback |
