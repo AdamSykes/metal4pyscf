@@ -18,9 +18,21 @@ Supports s/p/d/f shells (l=0,1,2,3), nroots up to 3.
 
 import numpy as np
 import mlx.core as mx
+import numba as nb
 from math import sqrt, pi
-from gpu4pyscf.lib.metal_kernels.eval_ao import _ncart, _cart2sph_matrix
-from gpu4pyscf.lib.metal_kernels.rys_jk import boys_function, _rys_from_boys
+from scipy.special import erf as _erf
+from gpu4pyscf.lib.metal_kernels.eval_ao import _cart2sph_matrix
+from gpu4pyscf.lib.metal_kernels.rys_jk import _rys_from_boys
+
+# Precomputed lookup tables (avoid 35K+ function calls)
+_NCART_LUT = np.array([1, 3, 6, 10], dtype=np.int64)   # l -> ncart
+_NSPH_LUT = np.array([1, 3, 5, 7], dtype=np.int64)      # l -> nsph
+
+def _ncart(l):
+    return int(_NCART_LUT[l])
+
+def _nsph(l):
+    return int(_NSPH_LUT[l])
 
 # ---------------------------------------------------------------------------
 # Metal kernel: TRR + HRR + Cartesian ERI output
@@ -29,7 +41,7 @@ from gpu4pyscf.lib.metal_kernels.rys_jk import boys_function, _rys_from_boys
 # builds the 1D g-values via TRR+HRR, assembles Cartesian ERI block.
 # ---------------------------------------------------------------------------
 
-# Task layout (TASK_STRIDE = 29 floats):
+# Task layout (TASK_STRIDE = 30 floats):
 #   [0]  aij
 #   [1]  akl
 #   [2:5]  PA (3 floats)
@@ -117,24 +129,7 @@ float Rpq[3] = {PA_x - QC_x + AB_x*0.0f, PA_y - QC_y, PA_z - QC_z};
 float g1d_final[3][4][4][4][4];
 
 for (int dir = 0; dir < 3; dir++) {
-    // Rys-modified recurrence centres
-    // P-A already in PA. Need Rpq = P - Q.
-    // We reconstruct Rpq from PA and QC:
-    //   Rpq = P - Q, PA = P - A, QC = Q - C
-    //   We need Rpq_dir for TRR, but it was removed from task data.
-    //   Actually Rpq is implicit: c0 = PA - rt_aij * Rpq, cp = QC + rt_akl * Rpq.
-    //   We need Rpq. But we removed it to save task stride.
-    //   Actually I can pass Rpq via the reserved slots!
-    // WORKAROUND: reconstruct from PA, QC, AB, CD
-    // P = A + PA, Q = C + QC
-    // A = arbitrary reference, C = arbitrary reference
-    // Rpq = P - Q = A + PA - C - QC
-    // But we don't have A or C separately!
-    // The correct approach: store Rpq in the task data.
-
-    // Actually, we DO need Rpq. Let me use the reserved slots [27:30].
-    // For now, I'll read them from task_data:
-    float Rpq_dir = task_data[off + 27 + dir];  // Rpq stored at [27:30]
+    float Rpq_dir = task_data[off + 27 + dir];
 
     float c0 = PA[dir] - rt_aij * Rpq_dir;
     float cp = QC[dir] + rt_akl * Rpq_dir;
@@ -220,224 +215,579 @@ _rys_eri_kernel = mx.fast.metal_kernel(
 )
 
 
+# ---------------------------------------------------------------------------
+# Vectorized Boys function and Rys roots
+# ---------------------------------------------------------------------------
+
+def _boys_function_vec(m_max, t_values):
+    """Vectorized Boys function via erf + upward recursion.
+
+    F_0(t) = sqrt(pi/4) / sqrt(t) * erf(sqrt(t))
+    F_{m+1}(t) = ((2m+1)*F_m(t) - exp(-t)) / (2t)
+    """
+    t = np.asarray(t_values, dtype=np.float64).ravel()
+    npts = len(t)
+    if npts == 0:
+        return np.zeros((m_max + 1, 0))
+    result = np.zeros((m_max + 1, npts))
+    small = t < 1e-15
+    big = ~small
+    for m in range(m_max + 1):
+        result[m, small] = 1.0 / (2 * m + 1)
+    if np.any(big):
+        tb = t[big]
+        sqt = np.sqrt(tb)
+        exp_neg = np.exp(-tb)
+        result[0, big] = np.sqrt(np.pi * 0.25) / sqt * _erf(sqt)
+        inv2t = 0.5 / tb
+        for m in range(m_max):
+            result[m + 1, big] = ((2 * m + 1) * result[m, big] - exp_neg) * inv2t
+    return result
+
+
+def _rys_from_boys_batch(nroots, fm):
+    """Vectorized Rys roots/weights from Boys moments for nroots=1,2,3.
+
+    Args:
+        nroots: int (1, 2, or 3)
+        fm: (m_max+1, N) array of Boys function values
+
+    Returns:
+        roots: (N, 3) zero-padded
+        weights: (N, 3) zero-padded
+    """
+    N = fm.shape[1]
+    roots = np.zeros((N, 3), dtype=np.float64)
+    weights = np.zeros((N, 3), dtype=np.float64)
+    if N == 0:
+        return roots, weights
+
+    if nroots == 1:
+        F0, F1 = fm[0], fm[1]
+        safe = F0 > 1e-30
+        roots[:, 0] = np.where(safe, F1 / np.maximum(F0, 1e-30), 0.0)
+        weights[:, 0] = F0
+
+    elif nroots == 2:
+        f0, f1, f2, f3 = fm[0], fm[1], fm[2], fm[3]
+        det = f0 * f2 - f1 * f1
+        safe = np.abs(det) > 1e-30
+        det_s = np.where(safe, det, 1.0)
+        c0 = np.where(safe, (f2 * f2 - f1 * f3) / det_s, 0.0)
+        c1 = np.where(safe, (f0 * f3 - f1 * f2) / det_s, 0.0)
+        disc = np.maximum(c1**2 + 4 * c0, 0.0)
+        sq = np.sqrt(disc)
+        t0 = (c1 - sq) / 2
+        t1 = (c1 + sq) / 2
+        sep = np.abs(t1 - t0)
+        sep_s = np.where(sep > 1e-30, sep, 1.0)
+        w1 = np.where(sep > 1e-30, (f1 - f0 * t0) / sep_s, f0 / 2)
+        w0 = f0 - w1
+        t_fb = np.where(f0 > 1e-30, f1 / np.maximum(f0, 1e-30), 0.0)
+        roots[:, 0] = np.where(safe, t0, t_fb)
+        roots[:, 1] = np.where(safe, t1, t_fb)
+        weights[:, 0] = np.where(safe, w0, f0 / 2)
+        weights[:, 1] = np.where(safe, w1, f0 / 2)
+
+    elif nroots == 3:
+        H = np.empty((N, 3, 3))
+        H[:, 0, 0] = fm[0]; H[:, 0, 1] = fm[1]; H[:, 0, 2] = fm[2]
+        H[:, 1, 0] = fm[1]; H[:, 1, 1] = fm[2]; H[:, 1, 2] = fm[3]
+        H[:, 2, 0] = fm[2]; H[:, 2, 1] = fm[3]; H[:, 2, 2] = fm[4]
+        rhs_h = np.stack([fm[3], fm[4], fm[5]], axis=1)
+        dets = np.linalg.det(H)
+        good = np.abs(dets) > 1e-30
+        bad = ~good
+        if np.any(bad):
+            t_fb = np.where(fm[0, bad] > 1e-30,
+                            fm[1, bad] / np.maximum(fm[0, bad], 1e-30), 0.0)
+            roots[bad, 0] = roots[bad, 1] = roots[bad, 2] = t_fb
+            weights[bad, 0] = weights[bad, 1] = weights[bad, 2] = fm[0, bad] / 3
+        if np.any(good):
+            c = np.linalg.solve(H[good], rhs_h[good])
+            n_g = c.shape[0]
+            comp = np.zeros((n_g, 3, 3))
+            comp[:, 1, 0] = 1.0
+            comp[:, 2, 1] = 1.0
+            comp[:, 0, 2] = c[:, 0]
+            comp[:, 1, 2] = c[:, 1]
+            comp[:, 2, 2] = c[:, 2]
+            r_g = np.real(np.linalg.eigvals(comp))
+            r_g.sort(axis=1)
+            roots[good, :3] = r_g
+            V = np.zeros((n_g, 3, 3))
+            V[:, :, 0] = 1.0
+            V[:, :, 1] = r_g
+            V[:, :, 2] = r_g ** 2
+            VT = V.transpose(0, 2, 1)
+            fm_rhs = fm[:3, good].T
+            vdets = np.linalg.det(VT)
+            vgood = np.abs(vdets) > 1e-30
+            good_idx = np.where(good)[0]
+            if np.any(vgood):
+                weights[good_idx[vgood], :3] = np.linalg.solve(
+                    VT[vgood], fm_rhs[vgood])
+            if np.any(~vgood):
+                for gi in good_idx[~vgood]:
+                    rt, wt = _rys_from_boys(3, fm[:, gi])
+                    roots[gi, :3] = rt
+                    weights[gi, :3] = wt
+
+    return roots, weights
+
+
+# ---------------------------------------------------------------------------
+# Schwarz screening (cached on mol)
+# ---------------------------------------------------------------------------
+
 def _schwarz_bounds(mol, nbas):
-    """Precompute Schwarz screening bounds Q[ish,jsh] = sqrt(max|(ij|ij)|)."""
+    """Schwarz screening bounds Q[ish,jsh] = sqrt(max|(ij|ij)|), cached."""
+    if hasattr(mol, '_schwarz_Q'):
+        return mol._schwarz_Q
     Q = np.zeros((nbas, nbas))
     for ish in range(nbas):
         for jsh in range(ish, nbas):
             eri = mol.intor('int2e', shls_slice=(
                 ish, ish + 1, jsh, jsh + 1, ish, ish + 1, jsh, jsh + 1))
             Q[ish, jsh] = Q[jsh, ish] = np.sqrt(np.max(np.abs(eri)))
+    mol._schwarz_Q = Q
     return Q
 
 
-def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10,
-                            max_nroots=3):
-    """Build per-primitive tasks with CPU-computed Rys roots/weights.
+# ---------------------------------------------------------------------------
+# Shell pair pre-computation
+# ---------------------------------------------------------------------------
 
-    Returns:
-        tasks: (N, TASK_STRIDE) float32 array for GPU
-        task_quartet_idx: (N,) int array mapping task → quartet
-        quartet_info: list of (i0, j0, k0, l0, li, lj, lk, ll) tuples
-        total_eri_size: total floats in the ERI output buffer
-        cpu_quartets: shell quartets needing nroots > max_nroots
+def _precompute_shell_pairs(nbas, shell_l, shell_R, shell_exps, shell_coeffs):
+    """Pre-compute primitive pair data for all unique shell pairs."""
+    pair_cache = {}
+    for ish in range(nbas):
+        li = shell_l[ish]
+        if li > 3:
+            continue
+        Ri = shell_R[ish]
+        ai = shell_exps[ish]
+        ci = shell_coeffs[ish]
+        for jsh in range(ish + 1):
+            lj = shell_l[jsh]
+            if lj > 3:
+                continue
+            Rj = shell_R[jsh]
+            aj = shell_exps[jsh]
+            cj = shell_coeffs[jsh]
+            ni, nj = len(ai), len(aj)
+            ai2 = np.repeat(ai, nj)
+            aj2 = np.tile(aj, ni)
+            ci2 = np.repeat(ci, nj)
+            cj2 = np.tile(cj, ni)
+            aij = ai2 + aj2
+            rr = np.dot(Ri - Rj, Ri - Rj)
+            Kab = np.exp(-ai2 * aj2 / aij * rr)
+            Pij = (ai2[:, None] * Ri + aj2[:, None] * Rj) / aij[:, None]
+            PA = Pij - Ri
+            coeff_K = ci2 * cj2 * Kab
+            AB = Ri - Rj
+            pair_cache[(ish, jsh)] = (aij, PA, Pij, coeff_K, AB)
+    return pair_cache
+
+
+# ---------------------------------------------------------------------------
+# Task generation with 8-fold symmetry and batched Rys roots
+# ---------------------------------------------------------------------------
+
+def _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_Q,
+                            schwarz_thresh=1e-10, max_nroots=3):
+    """Build per-primitive GPU tasks with 8-fold symmetry and grouped batching.
+
+    Three phases:
+      1. Light enumeration of valid quartets (Python loop, minimal work)
+      2. Group by (n_ij, n_kl) and batch cross-product expansion per group
+      3. Batch Boys/Rys across all primitives (3 calls total)
     """
     shell_l = np.array([mol.bas_angular(i) for i in range(nbas)])
     shell_atom = np.array([mol.bas_atom(i) for i in range(nbas)])
     atom_coords = np.array([mol.atom_coord(i) for i in range(mol.natm)])
     shell_R = atom_coords[shell_atom]
     shell_i0 = np.array([ao_loc[i] for i in range(nbas)])
-
     shell_exps = [mol.bas_exp(i) for i in range(nbas)]
     shell_coeffs = [mol._libcint_ctr_coeff(i).flatten() for i in range(nbas)]
+    Q = schwarz_Q
 
-    Q = _schwarz_bounds(mol, nbas)
+    pair_cache = _precompute_shell_pairs(
+        nbas, shell_l, shell_R, shell_exps, shell_coeffs)
 
-    all_tasks = []
-    all_quartet_idx = []
-    quartet_info = []
+    # Phase 1: enumerate valid quartets (lightweight)
+    valid_q = []
     cpu_quartets = []
-    eri_offset = 0
-
     for ish in range(nbas):
         li = shell_l[ish]
-        if li > 3: continue
-        Ri = shell_R[ish]
-        ai_arr = shell_exps[ish]
-        ci_arr = shell_coeffs[ish]
-
-        for jsh in range(nbas):
+        if li > 3:
+            continue
+        for jsh in range(ish + 1):
             lj = shell_l[jsh]
-            if lj > 3: continue
-            Rj = shell_R[jsh]
-            aj_arr = shell_exps[jsh]
-            cj_arr = shell_coeffs[jsh]
-            rr_ij = np.dot(Ri - Rj, Ri - Rj)
-            AB = Ri - Rj
-
-            ni_p, nj_p = len(ai_arr), len(aj_arr)
-            ai_2d = np.repeat(ai_arr, nj_p)
-            aj_2d = np.tile(aj_arr, ni_p)
-            ci_2d = np.repeat(ci_arr, nj_p)
-            cj_2d = np.tile(cj_arr, ni_p)
-            aij = ai_2d + aj_2d
-            Kab = np.exp(-ai_2d * aj_2d / aij * rr_ij)
-            Pij = (ai_2d[:, None] * Ri + aj_2d[:, None] * Rj) / aij[:, None]
-            PA = Pij - Ri
-            cicj_Kab = ci_2d * cj_2d * Kab
-
+            if lj > 3:
+                continue
+            ij = ish * (ish + 1) // 2 + jsh
             for ksh in range(nbas):
                 lk = shell_l[ksh]
-                if lk > 3: continue
-                Rk = shell_R[ksh]
-                ak_arr = shell_exps[ksh]
-                ck_arr = shell_coeffs[ksh]
-
-                for lsh in range(nbas):
+                if lk > 3:
+                    continue
+                for lsh in range(ksh + 1):
                     ll = shell_l[lsh]
-                    if ll > 3: continue
-
+                    if ll > 3:
+                        continue
+                    kl = ksh * (ksh + 1) // 2 + lsh
+                    if kl > ij:
+                        continue
                     if Q[ish, jsh] * Q[ksh, lsh] < schwarz_thresh:
                         continue
-
                     nroots = (li + lj + lk + ll) // 2 + 1
                     if nroots > max_nroots:
                         cpu_quartets.append((ish, jsh, ksh, lsh))
                         continue
+                    valid_q.append((ish, jsh, ksh, lsh,
+                                    li, lj, lk, ll, nroots))
 
-                    Rl = shell_R[lsh]
-                    al_arr = shell_exps[lsh]
-                    cl_arr = shell_coeffs[lsh]
-                    rr_kl = np.dot(Rk - Rl, Rk - Rl)
-                    CD = Rk - Rl
+    if not valid_q:
+        return (np.zeros((0, TASK_STRIDE), dtype=np.float32),
+                np.zeros(0, dtype=np.int32), [], 0, cpu_quartets)
 
-                    nk_p, nl_p = len(ak_arr), len(al_arr)
-                    ak_2d = np.repeat(ak_arr, nl_p)
-                    al_2d = np.tile(al_arr, nk_p)
-                    ck_2d = np.repeat(ck_arr, nl_p)
-                    cl_2d = np.tile(cl_arr, nk_p)
-                    akl = ak_2d + al_2d
-                    Kcd = np.exp(-ak_2d * al_2d / akl * rr_kl)
-                    Pkl = (ak_2d[:, None] * Rk + al_2d[:, None] * Rl) / akl[:, None]
-                    QC_arr = Pkl - Rk
-                    ckcl_Kcd = ck_2d * cl_2d * Kcd
+    # Phase 2: group by (n_ij, n_kl) for batched expansion
+    groups = {}
+    for q in valid_q:
+        n_ij = len(pair_cache[(q[0], q[1])][0])
+        n_kl = len(pair_cache[(q[2], q[3])][0])
+        groups.setdefault((n_ij, n_kl), []).append(q)
 
-                    n_ij = ni_p * nj_p
-                    n_kl = nk_p * nl_p
-                    aij_all = np.repeat(aij, n_kl)
-                    akl_all = np.tile(akl, n_ij)
-                    PA_all = np.repeat(PA, n_kl, axis=0)
-                    QC_all = np.tile(QC_arr, (n_ij, 1))
-                    Pij_all = np.repeat(Pij, n_kl, axis=0)
-                    Pkl_all = np.tile(Pkl, (n_ij, 1))
-                    Rpq_all = Pij_all - Pkl_all
-                    coeff_all = np.repeat(cicj_Kab, n_kl) * np.tile(ckcl_Kcd, n_ij)
+    all_blocks = []
+    all_t_vals = []
+    all_nroots_flat = []
+    all_qidx = []
+    quartet_info = []
+    eri_offset = 0
 
-                    mask = np.abs(coeff_all) > 1e-14
-                    if not np.any(mask):
-                        continue
+    for (n_ij, n_kl), gq_list in groups.items():
+        n_q = len(gq_list)
+        n_prim = n_ij * n_kl
 
-                    aij_m = aij_all[mask]
-                    akl_m = akl_all[mask]
-                    PA_m = PA_all[mask]
-                    QC_m = QC_all[mask]
-                    Rpq_m = Rpq_all[mask]
-                    coeff_m = coeff_all[mask]
+        ij_keys = [(g[0], g[1]) for g in gq_list]
+        kl_keys = [(g[2], g[3]) for g in gq_list]
 
-                    prefac = coeff_m * 2.0 * pi**2.5 / (aij_m * akl_m * np.sqrt(aij_m + akl_m))
-                    fac = fac_l.get(li, 1.0) * fac_l.get(lj, 1.0) * fac_l.get(lk, 1.0) * fac_l.get(ll, 1.0)
-                    prefac *= fac
+        # Stack pair data: (n_q, n_pair_prim[, 3])
+        aij_b = np.array([pair_cache[k][0] for k in ij_keys])
+        PA_b  = np.array([pair_cache[k][1] for k in ij_keys])
+        Pij_b = np.array([pair_cache[k][2] for k in ij_keys])
+        cK_ij = np.array([pair_cache[k][3] for k in ij_keys])
+        AB_b  = np.array([pair_cache[k][4] for k in ij_keys])
 
-                    # Compute Rys roots/weights on CPU in f64
-                    theta = aij_m * akl_m / (aij_m + akl_m)
-                    rr_pq = np.sum(Rpq_m**2, axis=1)
-                    t_vals = theta * rr_pq
-                    m_max = max(li + lj + lk + ll, 2 * nroots - 1)
-                    fm_all = boys_function(m_max, t_vals)  # (m_max+1, ntasks)
+        akl_b = np.array([pair_cache[k][0] for k in kl_keys])
+        QC_b  = np.array([pair_cache[k][1] for k in kl_keys])
+        Pkl_b = np.array([pair_cache[k][2] for k in kl_keys])
+        cK_kl = np.array([pair_cache[k][3] for k in kl_keys])
+        CD_b  = np.array([pair_cache[k][4] for k in kl_keys])
 
-                    ntasks = len(prefac)
-                    roots_arr = np.zeros((ntasks, 3), dtype=np.float64)
-                    weights_arr = np.zeros((ntasks, 3), dtype=np.float64)
-                    for t_idx in range(ntasks):
-                        rt, wt = _rys_from_boys(nroots, fm_all[:, t_idx])
-                        roots_arr[t_idx, :nroots] = rt
-                        weights_arr[t_idx, :nroots] = wt
+        # Batched cross-product: (n_q, n_prim[, 3])
+        aij_f  = np.repeat(aij_b, n_kl, axis=1)
+        akl_f  = np.tile(akl_b, (1, n_ij))
+        PA_f   = np.repeat(PA_b, n_kl, axis=1)
+        QC_f   = np.tile(QC_b, (1, n_ij, 1))
+        Rpq_f  = np.repeat(Pij_b, n_kl, axis=1) - np.tile(Pkl_b, (1, n_ij, 1))
+        coeff_f = np.repeat(cK_ij, n_kl, axis=1) * np.tile(cK_kl, (1, n_ij))
 
-                    ncart = _ncart(li) * _ncart(lj) * _ncart(lk) * _ncart(ll)
-                    q_idx = len(quartet_info)
-                    quartet_info.append((
-                        shell_i0[ish], shell_i0[jsh],
-                        shell_i0[ksh], shell_i0[lsh],
-                        li, lj, lk, ll,
-                    ))
+        # Prefactor: (n_q, n_prim)
+        prefac_f = coeff_f * 2.0 * pi**2.5 / (
+            aij_f * akl_f * np.sqrt(aij_f + akl_f))
+        fac_arr = np.array([
+            fac_l.get(g[4], 1.0) * fac_l.get(g[5], 1.0)
+            * fac_l.get(g[6], 1.0) * fac_l.get(g[7], 1.0)
+            for g in gq_list])
+        prefac_f *= fac_arr[:, None]
 
-                    block = np.zeros((ntasks, TASK_STRIDE), dtype=np.float32)
-                    block[:, 0] = aij_m
-                    block[:, 1] = akl_m
-                    block[:, 2:5] = PA_m
-                    block[:, 5:8] = QC_m
-                    block[:, 8] = AB[0]
-                    block[:, 9] = AB[1]
-                    block[:, 10] = AB[2]
-                    block[:, 11] = CD[0]
-                    block[:, 12] = CD[1]
-                    block[:, 13] = CD[2]
-                    block[:, 14] = prefac
-                    block[:, 15] = li
-                    block[:, 16] = lj
-                    block[:, 17] = lk
-                    block[:, 18] = ll
-                    block[:, 19] = np.arange(ntasks) * ncart + eri_offset
-                    block[:, 20] = nroots
-                    block[:, 21:24] = roots_arr.astype(np.float32)
-                    block[:, 24:27] = weights_arr.astype(np.float32)
-                    block[:, 27:30] = Rpq_m.astype(np.float32)  # Rpq for TRR
-                    all_tasks.append(block)
-                    all_quartet_idx.append(np.full(ntasks, q_idx, dtype=np.int32))
+        # t values: (n_q, n_prim)
+        theta = aij_f * akl_f / (aij_f + akl_f)
+        t_vals_f = theta * np.sum(Rpq_f**2, axis=2)
 
-                    eri_offset += ntasks * ncart
+        # Per-quartet metadata
+        li_a = np.array([g[4] for g in gq_list], dtype=np.float32)
+        lj_a = np.array([g[5] for g in gq_list], dtype=np.float32)
+        lk_a = np.array([g[6] for g in gq_list], dtype=np.float32)
+        ll_a = np.array([g[7] for g in gq_list], dtype=np.float32)
+        nr_a = np.array([g[8] for g in gq_list], dtype=np.float32)
+        ncarts = np.array([_ncart(g[4]) * _ncart(g[5])
+                           * _ncart(g[6]) * _ncart(g[7])
+                           for g in gq_list], dtype=np.int64)
 
-    if all_tasks:
-        tasks = np.concatenate(all_tasks, axis=0)
-        task_qidx = np.concatenate(all_quartet_idx)
-    else:
-        tasks = np.zeros((0, TASK_STRIDE), dtype=np.float32)
-        task_qidx = np.zeros(0, dtype=np.int32)
+        # ERI offsets: (n_q, n_prim)
+        eri_sizes = ncarts * n_prim
+        eri_bases = np.empty(n_q, dtype=np.int64)
+        eri_bases[0] = eri_offset
+        if n_q > 1:
+            np.cumsum(eri_sizes[:-1], out=eri_bases[1:])
+            eri_bases[1:] += eri_offset
+        prim_idx = np.arange(n_prim)
+        eri_off_f = eri_bases[:, None] + prim_idx[None, :] * ncarts[:, None]
+        eri_offset += int(eri_sizes.sum())
+
+        # Build task block: (n_q * n_prim, TASK_STRIDE)
+        total = n_q * n_prim
+        block = np.zeros((total, TASK_STRIDE), dtype=np.float32)
+        block[:, 0]    = aij_f.ravel()
+        block[:, 1]    = akl_f.ravel()
+        block[:, 2:5]  = PA_f.reshape(total, 3)
+        block[:, 5:8]  = QC_f.reshape(total, 3)
+        block[:, 8:11] = np.repeat(AB_b, n_prim, axis=0)
+        block[:, 11:14] = np.repeat(CD_b, n_prim, axis=0)
+        block[:, 14]   = prefac_f.ravel()
+        block[:, 15]   = np.repeat(li_a, n_prim)
+        block[:, 16]   = np.repeat(lj_a, n_prim)
+        block[:, 17]   = np.repeat(lk_a, n_prim)
+        block[:, 18]   = np.repeat(ll_a, n_prim)
+        block[:, 19]   = eri_off_f.ravel().astype(np.float32)
+        block[:, 20]   = np.repeat(nr_a, n_prim)
+        block[:, 27:30] = Rpq_f.reshape(total, 3).astype(np.float32)
+
+        all_blocks.append(block)
+        all_t_vals.append(t_vals_f.ravel())
+        all_nroots_flat.append(
+            np.repeat(nr_a.astype(np.int32), n_prim))
+
+        # Quartet info and task-to-quartet mapping
+        q_start = len(quartet_info)
+        for g in gq_list:
+            ish, jsh, ksh, lsh, li, lj, lk, ll, _nr = g
+            quartet_info.append((
+                shell_i0[ish], shell_i0[jsh],
+                shell_i0[ksh], shell_i0[lsh],
+                li, lj, lk, ll,
+                ish, jsh, ksh, lsh,
+            ))
+        all_qidx.append(np.repeat(
+            np.arange(q_start, q_start + n_q, dtype=np.int32), n_prim))
+
+    tasks = np.concatenate(all_blocks, axis=0)
+    task_qidx = np.concatenate(all_qidx)
+    t_all = np.concatenate(all_t_vals)
+    nroots_flat = np.concatenate(all_nroots_flat)
+
+    # Sort by quartet index so accumulation can use contiguous ranges
+    sort_idx = np.argsort(task_qidx, kind='mergesort')
+    tasks = tasks[sort_idx]
+    task_qidx = task_qidx[sort_idx]
+    t_all = t_all[sort_idx]
+    nroots_flat = nroots_flat[sort_idx]
+
+    # Phase 3: batched Boys + Rys (3 calls instead of ~3000)
+    for nr in (1, 2, 3):
+        nr_mask = nroots_flat == nr
+        if not np.any(nr_mask):
+            continue
+        m_max = 2 * nr - 1
+        fm = _boys_function_vec(m_max, t_all[nr_mask])
+        roots, weights = _rys_from_boys_batch(nr, fm)
+        tasks[nr_mask, 21:24] = roots.astype(np.float32)
+        tasks[nr_mask, 24:27] = weights.astype(np.float32)
+
     return tasks, task_qidx, quartet_info, eri_offset, cpu_quartets
 
 
-def _cart2sph_eri(eri_cart, li, lj, lk, ll):
-    """Transform a Cartesian ERI block to spherical harmonics.
+# ---------------------------------------------------------------------------
+# Cart-to-spherical with caching
+# ---------------------------------------------------------------------------
 
-    _cart2sph_matrix(l) returns shape (ncart, nsph).
-    """
+_c2s_cache = {}
+
+
+def _cart2sph_eri(eri_cart, li, lj, lk, ll):
+    """Transform a Cartesian ERI block to spherical harmonics."""
     eri = eri_cart
     if li >= 2:
-        c2s = _cart2sph_matrix(li)          # (ncart_i, nsph_i)
-        eri = np.einsum('ip,ijkl->pjkl', c2s, eri)
+        if li not in _c2s_cache:
+            _c2s_cache[li] = _cart2sph_matrix(li)
+        eri = np.einsum('ip,ijkl->pjkl', _c2s_cache[li], eri)
     if lj >= 2:
-        c2s = _cart2sph_matrix(lj)
-        eri = np.einsum('jq,pjkl->pqkl', c2s, eri)
+        if lj not in _c2s_cache:
+            _c2s_cache[lj] = _cart2sph_matrix(lj)
+        eri = np.einsum('jq,pjkl->pqkl', _c2s_cache[lj], eri)
     if lk >= 2:
-        c2s = _cart2sph_matrix(lk)
-        eri = np.einsum('kr,pqkl->pqrl', c2s, eri)
+        if lk not in _c2s_cache:
+            _c2s_cache[lk] = _cart2sph_matrix(lk)
+        eri = np.einsum('kr,pqkl->pqrl', _c2s_cache[lk], eri)
     if ll >= 2:
-        c2s = _cart2sph_matrix(ll)
-        eri = np.einsum('ls,pqrl->pqrs', c2s, eri)
+        if ll not in _c2s_cache:
+            _c2s_cache[ll] = _cart2sph_matrix(ll)
+        eri = np.einsum('ls,pqrl->pqrs', _c2s_cache[ll], eri)
     return eri
 
 
 def _nsph(l):
     """Number of spherical harmonics for angular momentum l."""
-    return 2 * l + 1 if l >= 2 else _ncart(l)
+    return int(_NSPH_LUT[l])
 
+
+@nb.njit(cache=True)
+def _sum_primitives_numba(eri_buf, task_eri_offsets,
+                          q_starts, q_counts, ncarts, n_q):
+    """Numba-compiled primitive ERI summation per quartet."""
+    total = 0
+    for q in range(n_q):
+        total += ncarts[q]
+    eri_flat = np.zeros(total, dtype=np.float64)
+    out_off = 0
+    for q in range(n_q):
+        nc = ncarts[q]
+        s = q_starts[q]
+        cnt = q_counts[q]
+        for t in range(cnt):
+            off = task_eri_offsets[s + t]
+            for x in range(nc):
+                eri_flat[out_off + x] += eri_buf[off + x]
+        out_off += nc
+    return eri_flat
+
+
+# ---------------------------------------------------------------------------
+# 8-fold symmetry J/K accumulation (Numba JIT)
+# ---------------------------------------------------------------------------
+
+@nb.njit(cache=True)
+def _accumulate_jk_numba(vj, vk, dm, eri_flat, eri_off,
+                         q_i0, q_j0, q_k0, q_l0,
+                         q_ni, q_nj, q_nk, q_nl,
+                         q_ish, q_jsh, q_ksh, q_lsh,
+                         do_j, do_k):
+    """Numba-compiled J/K accumulation with 8-fold symmetry unfolding."""
+    n_q = len(q_i0)
+    for q in range(n_q):
+        i0 = q_i0[q]; j0 = q_j0[q]; k0 = q_k0[q]; l0 = q_l0[q]
+        ni = q_ni[q]; nj = q_nj[q]; nk = q_nk[q]; nl = q_nl[q]
+        ish = q_ish[q]; jsh = q_jsh[q]; ksh = q_ksh[q]; lsh = q_lsh[q]
+        ij = ish * (ish + 1) // 2 + jsh
+        kl = ksh * (ksh + 1) // 2 + lsh
+        off = eri_off[q]
+        fkl = 2 if ksh != lsh else 1
+        fij = 2 if ish != jsh else 1
+
+        if do_j:
+            for i in range(ni):
+                for j in range(nj):
+                    s = 0.0
+                    for k in range(nk):
+                        for l in range(nl):
+                            s += dm[k0+k, l0+l] * eri_flat[off+((i*nj+j)*nk+k)*nl+l]
+                    g = fkl * s
+                    vj[i0+i, j0+j] += g
+                    if ish != jsh:
+                        vj[j0+j, i0+i] += g
+            if ij != kl:
+                for k in range(nk):
+                    for l in range(nl):
+                        s = 0.0
+                        for i in range(ni):
+                            for j in range(nj):
+                                s += dm[i0+i, j0+j] * eri_flat[off+((i*nj+j)*nk+k)*nl+l]
+                        g = fij * s
+                        vj[k0+k, l0+l] += g
+                        if ksh != lsh:
+                            vj[l0+l, k0+k] += g
+
+        if do_k:
+            for i in range(ni):
+                for k in range(nk):
+                    s = 0.0
+                    for j in range(nj):
+                        for l in range(nl):
+                            s += dm[j0+j, l0+l] * eri_flat[off+((i*nj+j)*nk+k)*nl+l]
+                    vk[i0+i, k0+k] += s
+                    if ij != kl:
+                        vk[k0+k, i0+i] += s
+            if ksh != lsh:
+                for i in range(ni):
+                    for l in range(nl):
+                        s = 0.0
+                        for j in range(nj):
+                            for k in range(nk):
+                                s += dm[j0+j, k0+k] * eri_flat[off+((i*nj+j)*nk+k)*nl+l]
+                        vk[i0+i, l0+l] += s
+                        if ij != kl:
+                            vk[l0+l, i0+i] += s
+            if ish != jsh:
+                for j in range(nj):
+                    for k in range(nk):
+                        s = 0.0
+                        for i in range(ni):
+                            for l in range(nl):
+                                s += dm[i0+i, l0+l] * eri_flat[off+((i*nj+j)*nk+k)*nl+l]
+                        vk[j0+j, k0+k] += s
+                        if ij != kl:
+                            vk[k0+k, j0+j] += s
+                if ksh != lsh:
+                    for j in range(nj):
+                        for l in range(nl):
+                            s = 0.0
+                            for i in range(ni):
+                                for k in range(nk):
+                                    s += dm[i0+i, k0+k] * eri_flat[off+((i*nj+j)*nk+k)*nl+l]
+                            vk[j0+j, l0+l] += s
+                            if ij != kl:
+                                vk[l0+l, j0+j] += s
+
+
+def _accumulate_jk_sym(vj, vk, dm, eri,
+                       i0, ni, j0, nj, k0, nk, l0, nl,
+                       ish, jsh, ksh, lsh, with_j, with_k):
+    """Python fallback for _accumulate_jk_numba (used by CPU quartets)."""
+    ie, je, ke, le = i0 + ni, j0 + nj, k0 + nk, l0 + nl
+    ij = ish * (ish + 1) // 2 + jsh
+    kl = ksh * (ksh + 1) // 2 + lsh
+
+    if with_j:
+        fkl = 2 if ksh != lsh else 1
+        gij = fkl * np.einsum('kl,ijkl->ij', dm[k0:ke, l0:le], eri)
+        vj[i0:ie, j0:je] += gij
+        if ish != jsh:
+            vj[j0:je, i0:ie] += gij.T
+        if ij != kl:
+            fij = 2 if ish != jsh else 1
+            gkl = fij * np.einsum('ij,ijkl->kl', dm[i0:ie, j0:je], eri)
+            vj[k0:ke, l0:le] += gkl
+            if ksh != lsh:
+                vj[l0:le, k0:ke] += gkl.T
+
+    if with_k:
+        k_ik = np.einsum('jl,ijkl->ik', dm[j0:je, l0:le], eri)
+        k_il = (np.einsum('jk,ijkl->il', dm[j0:je, k0:ke], eri)
+                if ksh != lsh else None)
+        k_jk = (np.einsum('il,ijkl->jk', dm[i0:ie, l0:le], eri)
+                if ish != jsh else None)
+        k_jl = (np.einsum('ik,ijkl->jl', dm[i0:ie, k0:ke], eri)
+                if ish != jsh and ksh != lsh else None)
+
+        vk[i0:ie, k0:ke] += k_ik
+        if k_il is not None:
+            vk[i0:ie, l0:le] += k_il
+        if k_jk is not None:
+            vk[j0:je, k0:ke] += k_jk
+        if k_jl is not None:
+            vk[j0:je, l0:le] += k_jl
+
+        if ij != kl:
+            vk[k0:ke, i0:ie] += k_ik.T
+            if k_il is not None:
+                vk[l0:le, i0:ie] += k_il.T
+            if k_jk is not None:
+                vk[k0:ke, j0:je] += k_jk.T
+            if k_jl is not None:
+                vk[l0:le, j0:je] += k_jl.T
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
     """Direct J/K via Rys quadrature: f64 roots + f32 GPU TRR + f64 accumulation.
 
-    Phase 1 (CPU f64): primitives, Boys function, Rys roots/weights
-    Phase 2 (Metal f32): TRR + HRR + per-primitive Cartesian ERI
-    Phase 3 (CPU f64): sum primitives per quartet, cart2sph, DM contraction
+    Uses 8-fold ERI symmetry to reduce work ~8x.
     """
     nao = mol.nao
     dm = np.asarray(dm, dtype=np.float64)
@@ -445,8 +795,11 @@ def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
     ao_loc = mol.ao_loc_nr()
     fac_l = {0: sqrt(1.0 / (4 * pi)), 1: sqrt(3.0 / (4 * pi))}
 
+    Q = _schwarz_bounds(mol, nbas)
+
     tasks, task_qidx, quartet_info, total_eri_size, cpu_quartets = \
-        _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, schwarz_thresh=1e-10)
+        _build_tasks_vectorized(mol, ao_loc, nbas, fac_l, Q,
+                                schwarz_thresh=1e-10)
 
     vj = np.zeros((nao, nao), dtype=np.float64) if with_j else None
     vk = np.zeros((nao, nao), dtype=np.float64) if with_k else None
@@ -474,40 +827,74 @@ def get_jk_rys_metal(mol, dm, with_j=True, with_k=True):
 
         eri_buf = np.array(result[0]).astype(np.float64)
 
-        # Phase 3a: CPU f64 accumulation for GPU quartets
+        # Phase 3a: Numba primitive sum + cart2sph + Numba J/K accumulation
         task_eri_offsets = tasks[:, 19].astype(np.int64)
 
-        for q_idx in range(len(quartet_info)):
-            i0, j0, k0, l0, li, lj, lk, ll = quartet_info[q_idx]
-            ni_c = _ncart(li)
-            nj_c = _ncart(lj)
-            nk_c = _ncart(lk)
-            nl_c = _ncart(ll)
-            ncart = ni_c * nj_c * nk_c * nl_c
+        n_q = len(quartet_info)
+        q_counts = np.bincount(task_qidx, minlength=n_q)
+        q_starts = np.empty(n_q + 1, dtype=np.int64)
+        q_starts[0] = 0
+        np.cumsum(q_counts, out=q_starts[1:])
 
-            task_mask = task_qidx == q_idx
-            offsets = task_eri_offsets[task_mask]
+        # Pre-compute per-quartet metadata arrays
+        q_meta = np.empty((n_q, 12), dtype=np.int64)
+        q_li = np.empty(n_q, dtype=np.int64)
+        q_lj = np.empty(n_q, dtype=np.int64)
+        q_lk = np.empty(n_q, dtype=np.int64)
+        q_ll = np.empty(n_q, dtype=np.int64)
+        for q_idx in range(n_q):
+            qi = quartet_info[q_idx]
+            q_meta[q_idx] = qi
+            q_li[q_idx] = qi[4]; q_lj[q_idx] = qi[5]
+            q_lk[q_idx] = qi[6]; q_ll[q_idx] = qi[7]
+        ncarts = (_NCART_LUT[q_li] * _NCART_LUT[q_lj]
+                  * _NCART_LUT[q_lk] * _NCART_LUT[q_ll])
+        nsphs = (_NSPH_LUT[q_li] * _NSPH_LUT[q_lj]
+                 * _NSPH_LUT[q_lk] * _NSPH_LUT[q_ll])
 
-            eri_sum = np.zeros(ncart, dtype=np.float64)
-            for off in offsets:
-                eri_sum += eri_buf[off:off + ncart]
+        # Numba primitive summing (replaces per-quartet fancy indexing)
+        eri_summed = _sum_primitives_numba(
+            eri_buf, task_eri_offsets, q_starts[:-1],
+            q_counts.astype(np.int64), ncarts, n_q)
 
-            eri_cart = eri_sum.reshape(ni_c, nj_c, nk_c, nl_c)
+        # Cart2sph + pack into pre-allocated flat array
+        total_sph = int(nsphs.sum())
+        eri_sph_flat = np.empty(total_sph, dtype=np.float64)
+        eri_sph_off = np.zeros(n_q, dtype=np.int64)
+        if n_q > 1:
+            np.cumsum(nsphs[:-1], out=eri_sph_off[1:])
+
+        cart_off = 0
+        for q_idx in range(n_q):
+            li, lj, lk, ll = int(q_li[q_idx]), int(q_lj[q_idx]), \
+                              int(q_lk[q_idx]), int(q_ll[q_idx])
+            nc = int(ncarts[q_idx])
+            ni_c = int(_NCART_LUT[li]); nj_c = int(_NCART_LUT[lj])
+            nk_c = int(_NCART_LUT[lk]); nl_c = int(_NCART_LUT[ll])
+            eri_cart = eri_summed[cart_off:cart_off + nc].reshape(
+                ni_c, nj_c, nk_c, nl_c)
             eri = _cart2sph_eri(eri_cart, li, lj, lk, ll)
+            ns = int(nsphs[q_idx])
+            eri_sph_flat[eri_sph_off[q_idx]:eri_sph_off[q_idx] + ns] = \
+                eri.ravel()
+            cart_off += nc
+            q_meta[q_idx, 4:8] = [_NSPH_LUT[li], _NSPH_LUT[lj],
+                                   _NSPH_LUT[lk], _NSPH_LUT[ll]]
 
-            ni_s = _nsph(li)
-            nj_s = _nsph(lj)
-            nk_s = _nsph(lk)
-            nl_s = _nsph(ll)
+        _vj = vj if vj is not None else np.zeros((nao, nao))
+        _vk = vk if vk is not None else np.zeros((nao, nao))
+        _accumulate_jk_numba(
+            _vj, _vk, dm, eri_sph_flat, eri_sph_off,
+            q_meta[:, 0], q_meta[:, 1], q_meta[:, 2], q_meta[:, 3],
+            q_meta[:, 4], q_meta[:, 5], q_meta[:, 6], q_meta[:, 7],
+            q_meta[:, 8], q_meta[:, 9], q_meta[:, 10], q_meta[:, 11],
+            with_j, with_k)
+        if with_j:
+            vj[:] = _vj
+        if with_k:
+            vk[:] = _vk
 
-            if with_j:
-                dm_kl = dm[k0:k0+nk_s, l0:l0+nl_s]
-                vj[i0:i0+ni_s, j0:j0+nj_s] += np.einsum('kl,ijkl->ij', dm_kl, eri)
-            if with_k:
-                dm_jl = dm[j0:j0+nj_s, l0:l0+nl_s]
-                vk[i0:i0+ni_s, k0:k0+nk_s] += np.einsum('jl,ijkl->ik', dm_jl, eri)
-
-    # Phase 3b: CPU fallback for nroots > max_nroots
+    # Phase 3b: CPU fallback for nroots > max_nroots (with symmetry)
     if cpu_quartets:
         _accumulate_cpu_quartets(mol, dm, ao_loc, cpu_quartets,
                                  vj, vk, with_j, with_k)
@@ -532,9 +919,6 @@ def _accumulate_cpu_quartets(mol, dm, ao_loc, cpu_quartets,
         nl = ao_loc[lsh + 1] - l0
         eri = eri.reshape(ni, nj, nk, nl)
 
-        if with_j:
-            dm_kl = dm[k0:k0+nk, l0:l0+nl]
-            vj[i0:i0+ni, j0:j0+nj] += np.einsum('kl,ijkl->ij', dm_kl, eri)
-        if with_k:
-            dm_jl = dm[j0:j0+nj, l0:l0+nl]
-            vk[i0:i0+ni, k0:k0+nk] += np.einsum('jl,ijkl->ik', dm_jl, eri)
+        _accumulate_jk_sym(vj, vk, dm, eri,
+                           i0, ni, j0, nj, k0, nk, l0, nl,
+                           ish, jsh, ksh, lsh, with_j, with_k)

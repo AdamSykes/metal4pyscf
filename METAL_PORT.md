@@ -188,7 +188,7 @@ Apple Silicon shares RAM between CPU and GPU. This means:
 | TDDFT / TDA | Ported | CPU fallback with f64 refinement (error < 3e-6 eV) |
 | Metal GPU acceleration | Active | DF-J/K 6-12x, eval_ao 1.1x, XC contraction 3.6x, end-to-end 1.5-3.9x |
 | Rys integral engine (CPU) | Working | Direct J/K for s/p/d/f, machine precision on def2-TZVPP |
-| Rys integral engine (Metal GPU) | **SCF-integrated** | f64 roots + f32 TRR/HRR on GPU + f64 accumulation, dE < 1e-9 Ha |
+| Rys integral engine (Metal GPU) | **SCF-integrated** | 102x optimised, 30ms for H₂O/def2-SVP (libcint 1.8ms) |
 | QM/MM | Ported | CPU fallback via PySCF |
 | PBC (periodic) | Ported | CPU fallback via PySCF |
 
@@ -329,16 +329,34 @@ Complete implementation of the Rys polynomial quadrature for 2-electron integral
 **Metal GPU kernel** (`rys_jk_metal.py`):
 
 Three-phase architecture for f64-accurate direct J/K with GPU acceleration:
-1. **CPU f64:** Boys function + Rys roots/weights via Hankel matrix (numerically stable in f64; the f32 Hankel solve diverges for nroots>=3 at large t)
+1. **CPU f64:** Boys function (vectorised erf + upward recursion) + Rys roots/weights via batched Hankel matrix solve (3 batched calls, grouped by nroots). The f32 Hankel solve diverges for nroots>=3 at large t, so f64 is mandatory.
 2. **Metal f32:** TRR + HRR + Cartesian ERI assembly. Each primitive gets its OWN output slot (no atomic adds, fully deterministic). MLX reuses output buffers, so the kernel explicitly zeros each slot before writing.
-3. **CPU f64:** Sum primitive ERI contributions per shell quartet, cart-to-spherical transformation for d/f shells, density matrix contraction to J/K.
+3. **CPU f64:** Numba-compiled primitive summation per shell quartet, cart-to-spherical transformation for d/f shells, Numba-compiled J/K accumulation with 8-fold symmetry unfolding.
 
-- Schwarz screening (precomputed Q bounds)
-- Vectorized numpy task generation
-- Nroots 1-3 on GPU (s/p/d shells); nroots > 3 falls back to PySCF libcint
-- One thread per primitive quartet
+Optimisations (102x speedup over initial implementation):
+- **8-fold ERI symmetry** — ish≥jsh, ksh≥lsh, ij≥kl reduces quartets ~8x
+- **Grouped batch expansion** — shell quartets grouped by (n_ij, n_kl); one batched repeat/tile per group eliminates per-quartet Python loops
+- **Vectorised Boys function** — scipy.special.erf + upward recursion (7x faster than gammainc)
+- **Batched Rys roots** — nroots=1 (closed-form), nroots=2 (Cramer's rule + quadratic), nroots=3 (batched 3×3 Hankel solve + companion matrix eigenvalues + Vandermonde). All primitives processed in 3 calls, not 3000.
+- **Numba JIT accumulation** — explicit compiled loops replace 17K numpy.einsum calls on tiny arrays (0.3ms vs 60ms)
+- **Numba primitive summation** — compiled per-quartet reduction replaces fancy indexing
+- **Pre-computed shell pairs** — pair data (aij, PA, Pij, Kab) cached once, avoids redundant kl-pair recomputation
+- **Schwarz bounds cached** on mol object; cart2sph matrices cached at module level
 
-**Accuracy:** dE < 1e-9 Ha vs PySCF CPU reference. J/K relative error ~2e-8 (f32 TRR precision, accumulated in f64). SCF converges at conv_tol=1e-8 without DIIS issues.
+**Performance (H₂O, Apple M4 Pro):**
+
+| Basis | Metal Rys | libcint (C) | Ratio | Original (unoptimised) |
+|-------|-----------|-------------|-------|------------------------|
+| STO-3G | **2.9 ms** | 0.3 ms | 9.7x | 233 ms (80x faster) |
+| def2-SVP | **29.9 ms** | 1.8 ms | 16.6x | 3054 ms (102x faster) |
+
+The GPU kernel itself is <1ms. The remaining gap to libcint is Python overhead in the build phase (~18ms: quartet enumeration, grouped expansion, Boys/Rys batching, sort) and Phase 3a (~8ms: cart2sph loop, metadata preparation). Closing this requires either Numba-compiling the entire pipeline or a monolithic Metal kernel — diminishing returns for small molecules.
+
+**Where Metal Rys sits in the performance landscape:**
+
+For small molecules, libcint (pure C, highly optimised, decades of development) is unbeatable. Metal Rys serves a different purpose: it provides a **correct, density-fitting-free J/K** on Apple Silicon that is fast enough for routine SCF convergence. The practical fast path is the DF engine (see below), which achieves real end-to-end speedups. Metal Rys is the fallback for methods that cannot use density fitting (e.g. exact exchange in hybrid DFT without DF, or testing/validation).
+
+**Accuracy:** dE < 1e-9 Ha vs PySCF CPU reference. J error ~4e-7, K error ~7e-8 (f32 TRR/HRR precision, all summation in f64). SCF converges at conv_tol=1e-8 without DIIS issues.
 
 **SCF integration:** The Metal Rys engine is the default `get_jk` on the MLX backend. No density fitting required.
 ```python
@@ -385,19 +403,31 @@ Higher derivative errors for caffeine are from f-function polynomial evaluation 
 
 **Performance note:** For large systems, materializing the full (4, ngrids, ncart) output buffer (~3 GB for caffeine/TZVPP) makes the deriv=1 kernel slower than CPU. The proper architecture is a **fused eval_ao + Vxc contraction kernel** that processes grid batches and contracts immediately, never materializing the full AO array. This is the CUDA code's approach (`_nr_rks_task` loops over grid batches).
 
-### Phase 4: Metal Integral Engine (major effort)
+### Roadmap: where performance comes from on Metal
 
-Translate the core CUDA integral kernels to Metal:
+**The density-fitting path is the practical Metal equivalent of what CUDA gives PySCF.** DF-J/K reduces to large GEMM (3-index tensor contractions), which maps directly to Metal's matmul hardware. This is where real end-to-end speedups come from — 1.5–3.5x already, scaling better with molecule size.
+
+**Direct integrals (Rys) cannot match CUDA's approach from Python.** CUDA's `libgvhf_rys` runs the entire J/K pipeline — task generation, Rys roots, TRR/HRR, contraction, accumulation — in a single kernel launch with zero Python round-trips. Our Metal Rys engine has a fast GPU kernel (<1ms) but ~30ms of Python orchestration. To match CUDA would require a monolithic Metal kernel that takes `(mol, dm)` → `(J, K)` in one dispatch — essentially writing a new ERI engine in Metal Shading Language.
+
+**Priorities for maximum return:**
+
+| Action | Effort | Expected gain |
+|--------|--------|---------------|
+| **Optimise DF-CDERI build** (move to Metal/Accelerate) | Medium | 2–3x end-to-end for DF-DFT |
+| **Reduce XC conversion overhead** in fused Metal kernels | Low | 1.2–1.5x for DFT |
+| **Larger molecules** where GPU parallelism dominates | None | Current code already benefits |
+| **Monolithic Metal J/K kernel** (full ERI in MSL) | High | Would match CUDA Rys for direct J/K |
+| Translate remaining CUDA kernels to Metal | High | Unlocks gradient/Hessian GPU paths |
+
+**Remaining CUDA kernel translation effort:**
 
 | Module | CUDA files | Purpose | Effort |
 |--------|-----------|---------|--------|
-| `gvhf-rys/` | 26 files | J/K matrix via Rys polynomials | Months |
+| `gvhf-rys/` | 26 files | J/K matrix via Rys polynomials (monolithic kernel) | Months |
 | `gint/` | 38 files | Gaussian integral evaluation | Months |
 | `gdft/` | 6 files | DFT grid integration | Weeks |
 | `multigrid/` | 13 files | Multi-grid DFT | Weeks |
 | `ecp/` | 13 files | Effective core potentials | Weeks |
-
-This is the bulk of the porting work and where the real performance gains lie.
 
 ### Key CUDA→Metal Translation Notes
 
