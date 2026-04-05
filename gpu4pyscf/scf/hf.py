@@ -316,12 +316,20 @@ def _patch_df_with_metal_jk(mf_df):
     ~ 1e-12, well below chemical accuracy.  A single f64 energy evaluation
     at the end restores full precision if needed.
     """
-    import importlib.util as _ilu, os as _os
-    _spec = _ilu.spec_from_file_location(
-        'gpu4pyscf.df.df_jk_metal',
-        _os.path.join(_os.path.dirname(__file__), '..', 'df', 'df_jk_metal.py'))
-    _mod = _ilu.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
+    import importlib.util as _ilu, os as _os, sys as _sys
+    # Register in sys.modules so subsequent `from gpu4pyscf.df.df_jk_metal
+    # import ...` (e.g. from df_grad_metal) sees the SAME module instance
+    # and shares the _tensor_cache dict.
+    if 'gpu4pyscf.df.df_jk_metal' in _sys.modules:
+        _mod = _sys.modules['gpu4pyscf.df.df_jk_metal']
+    else:
+        _spec = _ilu.spec_from_file_location(
+            'gpu4pyscf.df.df_jk_metal',
+            _os.path.join(_os.path.dirname(__file__), '..', 'df',
+                          'df_jk_metal.py'))
+        _mod = _ilu.module_from_spec(_spec)
+        _sys.modules['gpu4pyscf.df.df_jk_metal'] = _mod
+        _spec.loader.exec_module(_mod)
     get_jk_metal, clear_cache = _mod.get_jk_metal, _mod.clear_cache
     dfobj = mf_df.with_df
     _original_get_jk = dfobj.get_jk
@@ -343,6 +351,25 @@ def _patch_df_with_metal_jk(mf_df):
 
     dfobj.get_jk = _metal_get_jk
     dfobj.reset = _metal_reset
+
+    # Install Metal-accelerated DF gradient patch (Phase 1: CDERI reuse in
+    # _cho_solve_rhojk). Idempotent global monkey-patch on
+    # pyscf.df.grad.rhf._cho_solve_rhojk that only activates when a
+    # MetalDFTensors cache exists for the dfobj being used.
+    # Load directly (bypass gpu4pyscf.df.grad package __init__ which imports
+    # the cupy-based submodules).
+    _grad_modname = 'gpu4pyscf_df_grad_metal_loader'
+    if _grad_modname in _sys.modules:
+        _grad_mod = _sys.modules[_grad_modname]
+    else:
+        _grad_spec = _ilu.spec_from_file_location(
+            _grad_modname,
+            _os.path.join(_os.path.dirname(__file__), '..', 'df', 'grad',
+                          'df_grad_metal.py'))
+        _grad_mod = _ilu.module_from_spec(_grad_spec)
+        _sys.modules[_grad_modname] = _grad_mod
+        _grad_spec.loader.exec_module(_grad_mod)
+    _grad_mod.install_metal_grad_patch()
 
     # Relax convergence threshold to match f32 noise floor.
     # Metal J/K produce Fock matrices with ~1e-5 element-wise noise; at the

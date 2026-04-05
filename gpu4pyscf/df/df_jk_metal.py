@@ -145,6 +145,35 @@ class MetalDFTensors:
         self.naux = naux
         self.npairs = npairs
 
+        # Cholesky factor L of int2c (lower triangular) so that
+        # (P|mn) = L @ cderi[Q,mn]. Enables gradient-path reuse of cached
+        # CDERI (see gpu4pyscf.df.grad.df_grad_metal).
+        #
+        # Matches PySCF's cholesky_eri convention:
+        #   low = scipy.linalg.cholesky(int2c, lower=True)
+        #   cderi = solve_triangular(low, int3c, lower=True)
+        # (pyscf/df/incore.py::cholesky_eri, decompose_j2c='cd').
+        #
+        # If Cholesky fails (lindep / eig path), leave L_inv_T_gpu = None and
+        # the gradient path will fall through to CPU.
+        self.L_inv_T_gpu = None
+        self.L_inv_T_cpu = None  # f64, applied on CPU for precision
+        try:
+            import scipy.linalg as _sla
+            auxmol_local = getattr(dfobj, 'auxmol', None)
+            if auxmol_local is None:
+                from pyscf.df import addons as _addons
+                auxmol_local = _addons.make_auxmol(mol, auxbasis)
+            int2c = auxmol_local.intor('int2c2e', aosym='s1')
+            L = _sla.cholesky(int2c, lower=True)
+            L_inv = _sla.solve_triangular(L, np.eye(naux), lower=True)
+            self.L_inv_T_cpu = np.ascontiguousarray(L_inv.T)  # f64
+            self.L_inv_T_gpu = mx.array(L_inv.T.astype(np.float32))
+            mx.eval(self.L_inv_T_gpu)
+        except Exception:
+            self.L_inv_T_gpu = None
+            self.L_inv_T_cpu = None
+
 
 # Cache per DF object so we don't rebuild every call
 _tensor_cache = {}
