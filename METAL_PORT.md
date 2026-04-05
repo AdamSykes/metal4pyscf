@@ -262,41 +262,57 @@ Ported CUDA kernels to Metal via `mx.fast.metal_kernel()`:
 
 Metal kernels are in `gpu4pyscf/lib/metal_kernels/__init__.py`.
 
-### Phase 4: End-to-End Metal-Accelerated SCF (working)
+### Phase 4: End-to-End Metal-Accelerated DF-DFT SCF (working)
 
-The Metal DF-J/K engine is integrated into the SCF loop via `density_fit()`. Uses a mixed-precision convergence strategy:
+The Metal DF-J/K engine and Metal XC kernels are both integrated into the SCF loop via `density_fit()`. `_patch_df_with_metal_jk()` (in `gpu4pyscf/scf/hf.py`) replaces `with_df.get_jk` with the Metal f32 engine, and also installs `_patch_dft_veff_metal()` / `_patch_dft_veff_metal_uks()` which override the DFT `get_veff` to route XC evaluation through `nr_rks_metal` / `nr_uks_metal`.
 
-1. **GPU phase (f32):** First ~5-15 SCF cycles use Metal GPU J/K. Fast convergence to ~1e-5 Hartree.
-2. **CPU phase (f64):** Once delta_E < 1e-5, automatically switches to CPU f64 J/K for final convergence to full precision (1e-9).
+Cached `MetalDFTensors` (CDERI on GPU) persist across SCF calls via `gpu4pyscf/df/df_jk_metal.py`.
 
-This follows the approach from Codina et al. (JCTC 2025) for AI-focused GPUs without native f64.
+**Convergence strategy:** Default `conv_tol = 1e-4` for Metal DF objects (instead of 1e-9). Rationale: at the true minimum, f32 J/K noise gives a gradient-norm floor of ~1e-2 for larger molecules, so `conv_tol_grad = sqrt(conv_tol) = 0.01` is the tightest achievable. Energies are variational in the density → f32-converged densities give energies accurate to ≤1e-5 Ha. A f64 refinement step is run automatically before any gradient / Hessian / TDDFT calculation.
 
-**End-to-end SCF benchmarks (DF-B3LYP, cached GPU tensors):**
+**End-to-end SCF benchmarks (DF-B3LYP, M4 Pro, cached GPU tensors):**
 
-| System | AOs | CPU (s) | Metal (s) | Speedup | dE (Ha) | SCF cycles |
-|--------|-----|---------|-----------|---------|---------|------------|
-| H₂O / def2-TZVPP | 59 | 0.7 | 0.2 | **3.5x** | 2e-6 | 5 |
-| Caffeine / def2-SVP | 246 | 19.2 | 12.7 | **1.5x** | 2e-5 | 15 |
-| Caffeine / def2-TZVPP | 574 | 44.4 | 32.9 | **1.4x** | 6e-6 | 16 |
+| System | AOs | CPU (s) | Metal (s) | Speedup | dE (Ha) |
+|--------|-----|---------|-----------|---------|---------|
+| H₂O / def2-TZVP | 34 | 0.4 | 0.1 | **3.7x** | 2e-6 |
+| Benzene / def2-TZVP | 228 | 4.6 | 1.9 | **2.5x** | 7e-7 |
+| Naphthalene / def2-TZVP | 358 | 12.4 | 4.5 | **2.8x** | 3e-5 |
+| Aspirin / def2-TZVP | 451 | 21.6 | 6.7 | **3.2x** | 2e-6 |
+| Anthracene / def2-TZVP | 494 | 18.7 | 7.7 | **2.4x** | 4e-5 |
+| Caffeine / def2-TZVPP | 557 | 40.3 | 22.2 | **1.8x** | 6e-6 |
 
-All energies within chemical accuracy (1 kcal/mol = 1.6e-3 Ha). GPU tensor build cost (one-time, amortized) excluded from timing. Metal GPU accelerates both J/K contractions (6-12x per cycle) and XC grid integration (1.2x per cycle).
+Median RKS speedup across 13 systems spanning 3–36 atoms: **~2.8x**.
 
-**Convergence strategy:** ALL SCF cycles use Metal f32 J/K. Conv threshold auto-set to 1e-5 (f32 precision floor). The energy is variational, so f32-converged density gives energy accurate to ~1e-5 Ha — well within chemical accuracy for geometry optimization, thermochemistry, etc.
+### UKS (Unrestricted DFT)
 
-**Integration:** `gpu4pyscf/scf/hf.py::_patch_df_with_metal_jk()` patches `with_df.get_jk` on `density_fit()` objects. Cached GPU tensors (`MetalDFTensors`) persist across SCF calls via `gpu4pyscf/df/df_jk_metal.py`.
+UKS (open-shell) calculations go through `nr_uks_metal` (`gpu4pyscf/dft/numint_metal.py`) which computes alpha and beta densities in the same batch loop, calls libxc once with `spin=1` (spin-coupled XC), then contracts wv_alpha / wv_beta into separate vmat matrices on the GPU. The J/K side is batched in `_batched_jk` (`gpu4pyscf/df/df_jk_metal.py`): one matmul-pair for J across all spins, one half-transform for K.
 
-### XC Numerical Integration (not accelerated)
+| System | CPU | Metal | Speedup |
+|--------|-----|-------|---------|
+| NO₂ radical / def2-TZVP | 1.4s | 0.5s | **3.0x** |
+| Phenyl radical / def2-TZVPP | 9.3s | 2.3s | **4.0x** |
+| Phenyl radical / def2-TZVP | 10.7s | 1.6s | **6.5x** |
 
-Attempted Metal acceleration of the XC grid integration (`numint_metal.py`). The Vxc contraction (`aow.T @ ao`) is fast on GPU, but PySCF's C-level AO evaluation (`eval_ao`) dominates the total XC time (~80%) and cannot be accelerated via MLX.
+### XC Numerical Integration (accelerated)
 
-| Component | Time (574 AOs) | Accelerable? |
-|-----------|---------------|-------------|
-| AO evaluation (C) | ~800 ms | No — needs Metal compute shaders |
-| Density computation | ~200 ms | Partially — mostly C-level |
-| libxc XC evaluation | ~25 ms | No — CPU-bound, fast already |
-| Vxc contraction | ~200 ms | Yes — but savings eaten by data conversion |
+The XC path evaluates AOs on the grid via `eval_ao` Metal kernels, computes rho and Vxc on GPU using fused kernels (small molecules) or batched gemm (large molecules), and contracts the XC potential into `vmat` entirely on GPU. Only the libxc functional evaluation itself runs on CPU (single rho→libxc→wv roundtrip per SCF cycle).
 
-**Result:** Metal XC gives 0.7x (slower) due to numpy↔MLX conversion overhead exceeding the GPU gemm savings. The Metal `numint_metal.py` implementation is correct but not faster than PySCF CPU.
+**XC-only speedup on caffeine/def2-TZVPP (574 AOs):** 1029ms CPU → 318ms Metal = **3.2x**.
+
+Key optimizations in `gpu4pyscf/lib/metal_kernels/fused_xc.py`:
+- Grid coords pre-uploaded once per SCF cycle (not per batch)
+- wv (weights × vxc) pre-uploaded once per SCF cycle
+- shell_data cached on GPU (set up in `_prepare_shell_data`)
+- vmat accumulated on GPU, single download at end of loop
+- `_eval_ao_batch_gpu` accepts pre-uploaded MLX arrays directly
+
+The earlier naive implementation was 0.7x (slower) due to ~60 per-batch numpy↔MLX conversions dominating the GPU savings. Eliminating those gives the current 3.2x speedup.
+
+### Analytical Gradients and Hessians (correct, not faster)
+
+`.Gradients().kernel()` and `.Hessian().kernel()` work and give correct results (1e-7 to 1e-6 accuracy on typical molecules) via automatic f64 refinement: the Metal-converged density seeds a short PySCF CPU f64 SCF which provides the tight density needed for analytical derivatives.
+
+End-to-end wall time is roughly equal to CPU — the SCF savings (2-5x) are consumed by (a) the f64 refinement pass (~40% of gradient wall time) and (b) PySCF's CPU-bound gradient/Hessian analytical integral code which is not Metal-accelerated. The current `_refine_to_f64` uses `conv_tol=1e-10, max_cycle=10`; lighter refinement fails the 1e-5 gradient accuracy threshold on larger aromatics.
 
 ### Metal eval_ao (working)
 
