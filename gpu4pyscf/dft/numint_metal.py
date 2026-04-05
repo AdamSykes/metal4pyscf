@@ -8,7 +8,7 @@ go to CPU for libxc, then wv comes back for Vxc contraction.
 
 import numpy as np
 from gpu4pyscf.lib.metal_kernels.eval_ao import _prepare_shell_data
-from gpu4pyscf.lib.metal_kernels.fused_xc import fused_rho_vxc
+from gpu4pyscf.lib.metal_kernels.fused_xc import fused_rho_vxc, _batched_rho_vxc_uks
 
 
 def nr_rks_metal(ni, mol, grids, xc_code, dm, hermi=1, max_memory=2000):
@@ -22,5 +22,29 @@ def nr_rks_metal(ni, mol, grids, xc_code, dm, hermi=1, max_memory=2000):
 
     return fused_rho_vxc(
         mol, coords, dm, weights, ni, xc_code, xctype,
+        shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping,
+        shell_data_gpu)
+
+
+def nr_uks_metal(ni, mol, grids, xc_code, dms, hermi=1, max_memory=2000):
+    """Fully Metal GPU-accelerated nr_uks (unrestricted DFT).
+
+    dms: (2, nao, nao) or tuple (dm_a, dm_b) — alpha/beta density matrices.
+    Returns (nelec, excsum, vmat) where nelec is (2,) and vmat is (2, nao, nao).
+    """
+    xctype = ni._xc_type(xc_code)
+    shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping, shell_data_gpu = \
+        _prepare_shell_data(mol)
+
+    coords = np.asarray(grids.coords)
+    weights = np.asarray(grids.weights)
+
+    dms = np.asarray(dms)
+    if dms.ndim != 3 or dms.shape[0] != 2:
+        raise ValueError(f'nr_uks_metal expects (2,nao,nao) dm, got shape {dms.shape}')
+    dm_a, dm_b = dms[0], dms[1]
+
+    return _batched_rho_vxc_uks(
+        mol, coords, dm_a, dm_b, weights, ni, xc_code, xctype,
         shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping,
         shell_data_gpu)

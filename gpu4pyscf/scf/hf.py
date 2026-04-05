@@ -212,6 +212,99 @@ def _patch_dft_veff_metal(mf_df):
     mf_df.get_veff = _metal_get_veff
 
 
+def _patch_dft_veff_metal_uks(mf_df):
+    """Override get_veff on a DF-UKS object to use Metal XC.
+
+    Mirrors _patch_dft_veff_metal but for unrestricted DFT: densities are
+    (2, nao, nao) stacks (alpha, beta), and the XC potential, J/K, and
+    energy accounting all follow pyscf.dft.uks.get_veff semantics (no 0.5
+    factor on vk; vj summed over spins).
+
+    Only engages for 3D (2,nao,nao) ground-state densities; response
+    calculations fall through to PySCF's CPU numint code.
+    """
+    import importlib.util as _ilu, os as _os
+    _spec = _ilu.spec_from_file_location(
+        'numint_metal',
+        _os.path.join(_os.path.dirname(__file__), '..', 'dft', 'numint_metal.py'))
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _nr_uks_metal = _mod.nr_uks_metal
+
+    from pyscf.lib import tag_array as _tag_array
+
+    def _metal_get_veff(mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+        if mol is None: mol = mf_df.mol
+        if dm is None: dm = mf_df.make_rdm1()
+        if not isinstance(dm, np.ndarray):
+            dm = np.asarray(dm)
+        if dm.ndim == 2:  # RHF DM fallback (unusual)
+            dm = np.repeat(dm[None]*.5, 2, axis=0)
+        mf_df.initialize_grids(mol, dm)
+        ni = mf_df._numint
+
+        ground_state = (dm.ndim == 3 and dm.shape[0] == 2)
+
+        if hermi == 2:
+            n, exc, vxc = (0, 0), 0, 0
+        elif ground_state:
+            try:
+                n, exc, vxc = _nr_uks_metal(ni, mol, mf_df.grids, mf_df.xc, dm)
+            except Exception:
+                n, exc, vxc = ni.nr_uks(mol, mf_df.grids, mf_df.xc, dm)
+            if mf_df.do_nlc():
+                if ni.libxc.is_nlc(mf_df.xc):
+                    xc = mf_df.xc
+                else:
+                    xc = mf_df.nlc
+                n, enlc, vnlc = ni.nr_nlc_vxc(mol, mf_df.nlcgrids, xc, dm[0]+dm[1])
+                exc += enlc
+                vxc += vnlc
+            logger.debug(mf_df, 'nelec by numeric integration = %s', n)
+        else:
+            n, exc, vxc = ni.nr_uks(mol, mf_df.grids, mf_df.xc, dm)
+
+        # J/K assembly (matches pyscf.dft.uks.get_veff exactly)
+        if not ni.libxc.is_hybrid_xc(mf_df.xc):
+            vk = None
+            vj = mf_df.get_j(mol, dm[0] + dm[1], hermi)
+            vxc = vxc + vj
+        else:
+            omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf_df.xc, spin=mol.spin)
+            if omega == 0:
+                vj, vk = mf_df.get_jk(mol, dm, hermi)
+                vk *= hyb
+            elif alpha == 0:
+                vj = mf_df.get_j(mol, dm, hermi)
+                vk = mf_df.get_k(mol, dm, hermi, omega=-omega)
+                vk *= hyb
+            elif hyb == 0:
+                vj = mf_df.get_j(mol, dm, hermi)
+                vk = mf_df.get_k(mol, dm, hermi, omega=omega)
+                vk *= alpha
+            else:
+                vj, vk = mf_df.get_jk(mol, dm, hermi)
+                vk *= hyb
+                vklr = mf_df.get_k(mol, dm, hermi, omega=omega)
+                vklr *= (alpha - hyb)
+                vk += vklr
+            vj = vj[0] + vj[1]
+            vxc += vj - vk  # note: no 0.5 factor for UKS
+            if ground_state:
+                exc -= (np.einsum('ij,ji', dm[0], vk[0]).real +
+                        np.einsum('ij,ji', dm[1], vk[1]).real) * .5
+
+        if ground_state:
+            ecoul = np.einsum('ij,ji', dm[0] + dm[1], vj).real * .5
+        else:
+            ecoul = None
+
+        vxc = _tag_array(vxc, ecoul=ecoul, exc=exc, vj=vj, vk=vk)
+        return vxc
+
+    mf_df.get_veff = _metal_get_veff
+
+
 def _patch_df_with_metal_jk(mf_df):
     """Replace the DF object's get_jk with Metal GPU f32 engine.
 
@@ -259,10 +352,14 @@ def _patch_df_with_metal_jk(mf_df):
     if mf_df.conv_tol < 1e-4:
         mf_df.conv_tol = 1e-4
 
-    # For DF-RKS: route XC evaluation through the Metal GPU engine.
-    # UKS and DF-HF fall through (UKS: no nr_uks_metal yet; HF: no XC).
-    if hasattr(mf_df, 'xc') and type(mf_df).__name__ == 'DFRKS':
-        _patch_dft_veff_metal(mf_df)
+    # For DF-DFT: route XC evaluation through the Metal GPU engine.
+    # DF-HF falls through (no XC).
+    if hasattr(mf_df, 'xc'):
+        _cls_name = type(mf_df).__name__
+        if _cls_name == 'DFRKS':
+            _patch_dft_veff_metal(mf_df)
+        elif _cls_name == 'DFUKS':
+            _patch_dft_veff_metal_uks(mf_df)
 
     # Override nuc_grad_method and Hessian to do f64 refinement first
     _original_ngm = mf_df.nuc_grad_method

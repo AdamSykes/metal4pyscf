@@ -187,10 +187,40 @@ def _get_occ_coeff(dm):
     return v[:, mask] * np.sqrt(w[mask])
 
 
+def _single_jk(tensors, dm_2d, nao, naux, with_j, with_k, hermi):
+    """Compute J and K for a single (nao,nao) density matrix."""
+    vj = vk = None
+    if with_j:
+        dm_packed_gpu = mx.array(_pack_dm(dm_2d, nao).astype(np.float32))
+        rho_q = tensors.cderi_tril_gpu @ dm_packed_gpu
+        vj_packed = mx.transpose(tensors.cderi_tril_gpu) @ rho_q
+        mx.eval(vj_packed)
+        vj_f64 = np.array(vj_packed).astype(np.float64)
+        vj = np.zeros((nao, nao))
+        idx = np.tril_indices(nao)
+        vj[idx] = vj_f64
+        vj = vj + vj.T
+        np.fill_diagonal(vj, np.diag(vj) * 0.5)
+    if with_k:
+        L = _get_occ_coeff(dm_2d)
+        L_gpu = mx.array(L.astype(np.float32))
+        nocc = L.shape[1]
+        Y = tensors.cderi_full_gpu.reshape(naux * nao, nao) @ L_gpu
+        Y_t = mx.transpose(Y.reshape(naux, nao, nocc), axes=(1, 0, 2)).reshape(nao, -1)
+        vk_gpu = Y_t @ mx.transpose(Y_t)
+        mx.eval(vk_gpu)
+        vk = np.array(vk_gpu).astype(np.float64)
+        if hermi:
+            vk = (vk + vk.T) * 0.5
+    return vj, vk
+
+
 def get_jk_metal(dfobj, dm, hermi=1, with_j=True, with_k=True):
     """Compute DF J/K on Metal GPU.
 
-    First call builds and caches GPU tensors. Subsequent calls reuse them.
+    Handles both 2D (nao,nao) RHF/RKS density and 3D (n,nao,nao) stacks
+    for UKS (alpha/beta) or other multi-density cases. First call builds
+    and caches GPU tensors; subsequent calls reuse them.
     """
     log = logger.new_logger(dfobj.mol, dfobj.verbose)
     t0 = log.init_timer()
@@ -200,42 +230,18 @@ def get_jk_metal(dfobj, dm, hermi=1, with_j=True, with_k=True):
     naux = tensors.naux
 
     dm = np.asarray(dm)
-    if dm.ndim == 3:
-        dm = dm[0]
-
-    vj = vk = None
-
-    if with_j:
-        dm_packed_gpu = mx.array(_pack_dm(dm, nao).astype(np.float32))
-        # J in packed space: two gemvs, pure GPU
-        rho_q = tensors.cderi_tril_gpu @ dm_packed_gpu          # (naux,)
-        vj_packed = mx.transpose(tensors.cderi_tril_gpu) @ rho_q  # (npairs,)
-        mx.eval(vj_packed)
-        vj_f64 = np.array(vj_packed).astype(np.float64)
-        # Unpack to full
-        vj = np.zeros((nao, nao))
-        idx = np.tril_indices(nao)
-        vj[idx] = vj_f64
-        vj = vj + vj.T
-        np.fill_diagonal(vj, np.diag(vj) * 0.5)
-
-    if with_k:
-        # Half-transform: Y[Q,i,a] = cderi[Q,i,j] @ L[j,a]
-        L = _get_occ_coeff(dm)
-        L_gpu = mx.array(L.astype(np.float32))
-        nocc = L.shape[1]
-
-        # cderi_full_gpu is (naux, nao, nao), already on GPU
-        Y = tensors.cderi_full_gpu.reshape(naux * nao, nao) @ L_gpu  # (naux*nao, nocc)
-
-        # K = sum_{Q,a} Y[Q,i,a]*Y[Q,j,a]
-        Y_t = mx.transpose(Y.reshape(naux, nao, nocc), axes=(1, 0, 2)).reshape(nao, -1)
-        vk_gpu = Y_t @ mx.transpose(Y_t)  # (nao, nao)
-        mx.eval(vk_gpu)
-
-        vk = np.array(vk_gpu).astype(np.float64)
-        if hermi:
-            vk = (vk + vk.T) * 0.5
+    if dm.ndim == 2:
+        vj, vk = _single_jk(tensors, dm, nao, naux, with_j, with_k, hermi)
+    elif dm.ndim == 3:
+        vjs, vks = [], []
+        for i in range(dm.shape[0]):
+            vj_i, vk_i = _single_jk(tensors, dm[i], nao, naux, with_j, with_k, hermi)
+            if with_j: vjs.append(vj_i)
+            if with_k: vks.append(vk_i)
+        vj = np.stack(vjs) if with_j else None
+        vk = np.stack(vks) if with_k else None
+    else:
+        raise ValueError(f'get_jk_metal: dm must be 2D or 3D, got ndim={dm.ndim}')
 
     t0 = log.timer_debug1('DF-JK Metal GPU', *t0)
     return vj, vk
