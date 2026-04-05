@@ -329,7 +329,8 @@ def _build_ao_mapping(mol):
 
 
 def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
-                  shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping):
+                  shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping,
+                  shell_data_gpu):
     """Compute rho and Vxc with fused GPU kernels where possible.
 
     Uses the fused threadgroup kernel for rho (LDA only, s/p basis).
@@ -348,7 +349,8 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
         # Batched approach (existing, works for all cases)
         return _batched_rho_vxc(
             mol, coords, dm, weights, ni, xc_code, xctype,
-            shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping)
+            shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping,
+            shell_data_gpu)
 
     # --- Fused rho for LDA s/p basis ---
     ngrids = coords.shape[0]
@@ -359,7 +361,6 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
     c2s_off_gpu = mx.array(c2s_off)
     c2s_nc_gpu = mx.array(c2s_nc)
     dm_gpu = mx.array(np.asarray(dm, dtype=np.float32).ravel())
-    shell_data_gpu = mx.array(shell_data.ravel())
 
     gridx = mx.array(coords[:, 0].astype(np.float32))
     gridy = mx.array(coords[:, 1].astype(np.float32))
@@ -405,32 +406,40 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
     excsum = np.dot(den, exc)
 
     # Vxc contraction uses batched approach (needs AO array for gemm)
+    # Pre-upload wv to GPU once (avoid per-batch numpy→MLX conversion)
     wv = weights * vxc
     ao_deriv = 1 if xctype == 'GGA' else 0
-    vmat = np.zeros((nao, nao))
+    if xctype == 'LDA':
+        wv_gpu_all = mx.array(wv[0].astype(np.float32))
+    else:  # GGA
+        wv_all = wv.copy()
+        wv_all[0] *= 0.5
+        wv_gpu_all = mx.array(wv_all.astype(np.float32))
+
+    # Grid coords already on GPU (gridx/gridy/gridz); slice per batch (MLX view)
+    vmat_gpu = mx.zeros((nao, nao), dtype=mx.float32)
     BATCH = 20000
     for p0 in range(0, ngrids, BATCH):
         p1 = min(p0 + BATCH, ngrids)
         ng = p1 - p0
         ao_gpu = _eval_ao_batch_gpu(
-            mol, coords[p0:p1], ao_deriv, shell_data, exps_gpu, coeffs_gpu,
+            mol, gridx[p0:p1], gridy[p0:p1], gridz[p0:p1],
+            ao_deriv, shell_data_gpu, exps_gpu, coeffs_gpu,
             ncart_total, shell_mapping, ng)
 
         if xctype == 'LDA':
-            wv_gpu = mx.array(wv[0][p0:p1].astype(np.float32))
-            vmat_blk = (ao_gpu * wv_gpu[None, :]) @ mx.transpose(ao_gpu)
+            wv_blk = wv_gpu_all[p0:p1]
+            vmat_gpu = vmat_gpu + (ao_gpu * wv_blk[None, :]) @ mx.transpose(ao_gpu)
         else:  # GGA
-            wv_b = wv[:, p0:p1].copy()
-            wv_b[0] *= 0.5
-            wv_gpu = [mx.array(wv_b[d].astype(np.float32)) for d in range(4)]
+            wv_blk = wv_gpu_all[:, p0:p1]
             ao_val = ao_gpu[0]
-            aow = ao_gpu[0] * wv_gpu[0][None, :]
+            aow = ao_gpu[0] * wv_blk[0][None, :]
             for d in range(1, 4):
-                aow = aow + ao_gpu[d] * wv_gpu[d][None, :]
-            vmat_blk = aow @ mx.transpose(ao_val)
+                aow = aow + ao_gpu[d] * wv_blk[d][None, :]
+            vmat_gpu = vmat_gpu + aow @ mx.transpose(ao_val)
 
-        mx.eval(vmat_blk)
-        vmat += np.array(vmat_blk, dtype=np.float64)
+    mx.eval(vmat_gpu)
+    vmat = np.array(vmat_gpu, dtype=np.float64)
 
     if xctype == 'GGA':
         vmat = vmat + vmat.T
@@ -439,16 +448,22 @@ def fused_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
 
 
 def _batched_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
-                     shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping):
+                     shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping,
+                     shell_data_gpu):
     """Batched eval_ao + rho + Vxc (existing approach, works for all cases)."""
     nao = mol.nao
     ngrids = coords.shape[0]
     dm_gpu = mx.array(np.asarray(dm, dtype=np.float32))
     ao_deriv = 1 if xctype in ('GGA', 'MGGA') else 0
 
+    # Pre-upload grid coords once (avoid per-batch numpy→MLX conversion)
+    gridx_all = mx.array(coords[:, 0].astype(np.float32))
+    gridy_all = mx.array(coords[:, 1].astype(np.float32))
+    gridz_all = mx.array(coords[:, 2].astype(np.float32))
+
     nelec = 0.0
     excsum = 0.0
-    vmat = np.zeros((nao, nao))
+    vmat_gpu = mx.zeros((nao, nao), dtype=mx.float32)
 
     BATCH = 20000
     for p0 in range(0, ngrids, BATCH):
@@ -457,7 +472,8 @@ def _batched_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
         wt = weights[p0:p1]
 
         ao_gpu = _eval_ao_batch_gpu(
-            mol, coords[p0:p1], ao_deriv, shell_data, exps_gpu, coeffs_gpu,
+            mol, gridx_all[p0:p1], gridy_all[p0:p1], gridz_all[p0:p1],
+            ao_deriv, shell_data_gpu, exps_gpu, coeffs_gpu,
             ncart_total, shell_mapping, ng)
 
         if xctype == 'LDA':
@@ -488,7 +504,7 @@ def _batched_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
         wv = wt * vxc
         if xctype == 'LDA':
             wv_gpu = mx.array(wv[0].astype(np.float32))
-            vmat_blk = (ao_val * wv_gpu[None, :]) @ mx.transpose(ao_val)
+            vmat_gpu = vmat_gpu + (ao_val * wv_gpu[None, :]) @ mx.transpose(ao_val)
         else:
             wv[0] *= 0.5
             wv_gpu = [mx.array(wv[d].astype(np.float32)) for d in range(min(4, len(wv)))]
@@ -500,9 +516,11 @@ def _batched_rho_vxc(mol, coords, dm, weights, ni, xc_code, xctype,
                 wv4 = mx.array((wv[4] * 0.5).astype(np.float32))
                 for d in range(1, 4):
                     vmat_blk = vmat_blk + (ao_gpu[d] * wv4[None, :]) @ mx.transpose(ao_gpu[d])
+            vmat_gpu = vmat_gpu + vmat_blk
 
-        mx.eval(vmat_blk)
-        vmat += np.array(vmat_blk, dtype=np.float64)
+        mx.eval(vmat_gpu)
+
+    vmat = np.array(vmat_gpu, dtype=np.float64)
 
     if xctype in ('GGA', 'MGGA'):
         vmat = vmat + vmat.T

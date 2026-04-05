@@ -14,7 +14,7 @@ from gpu4pyscf.lib.metal_kernels.fused_xc import fused_rho_vxc
 def nr_rks_metal(ni, mol, grids, xc_code, dm, hermi=1, max_memory=2000):
     """Fully Metal GPU-accelerated nr_rks."""
     xctype = ni._xc_type(xc_code)
-    shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping = \
+    shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping, shell_data_gpu = \
         _prepare_shell_data(mol)
 
     coords = np.asarray(grids.coords)
@@ -22,4 +22,5 @@ def nr_rks_metal(ni, mol, grids, xc_code, dm, hermi=1, max_memory=2000):
 
     return fused_rho_vxc(
         mol, coords, dm, weights, ni, xc_code, xctype,
-        shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping)
+        shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping,
+        shell_data_gpu)

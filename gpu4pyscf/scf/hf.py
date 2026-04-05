@@ -120,6 +120,98 @@ if BACKEND_NAME != 'cupy':
         raise NotImplementedError(
             'Smearing is not yet available on the %s backend' % BACKEND_NAME)
 
+def _patch_dft_veff_metal(mf_df):
+    """Override get_veff on a DF-RKS object to use Metal XC.
+
+    The PySCF DF-RKS class (instantiated by .density_fit()) inherits
+    get_veff from pyscf.dft.rks, which calls ni.nr_rks() on the CPU.
+    This wrapper replaces it with one that calls nr_rks_metal for the
+    Metal GPU XC path, keeping all other semantics identical to PySCF's
+    version (J/K assembly, ecoul/exc accounting, hermi=2 handling).
+
+    Only engages for 2D density matrices; response calculations passing
+    3D dm (CPHF) fall through to PySCF's CPU numint code.
+    """
+    import importlib.util as _ilu, os as _os
+    _spec = _ilu.spec_from_file_location(
+        'numint_metal',
+        _os.path.join(_os.path.dirname(__file__), '..', 'dft', 'numint_metal.py'))
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _nr_rks_metal = _mod.nr_rks_metal
+
+    from pyscf.lib import tag_array as _tag_array
+
+    def _metal_get_veff(mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+        if mol is None: mol = mf_df.mol
+        if dm is None: dm = mf_df.make_rdm1()
+        mf_df.initialize_grids(mol, dm)
+        ni = mf_df._numint
+
+        dm_np = np.asarray(dm)
+        ground_state = (dm_np.ndim == 2)
+
+        if hermi == 2:  # anti-Hermitian, rho = 0
+            n, exc, vxc = 0, 0, 0
+        elif ground_state:
+            # Ground-state 2D density: use Metal XC
+            try:
+                n, exc, vxc = _nr_rks_metal(ni, mol, mf_df.grids, mf_df.xc, dm_np)
+            except Exception:
+                n, exc, vxc = ni.nr_rks(mol, mf_df.grids, mf_df.xc, dm_np)
+            if mf_df.do_nlc():
+                if ni.libxc.is_nlc(mf_df.xc):
+                    xc = mf_df.xc
+                else:
+                    xc = mf_df.nlc
+                n, enlc, vnlc = ni.nr_nlc_vxc(mol, mf_df.nlcgrids, xc, dm_np)
+                exc += enlc
+                vxc += vnlc
+            logger.debug(mf_df, 'nelec by numeric integration = %s', n)
+        else:
+            # Non-2D (e.g., response dm): fall through to CPU numint
+            n, exc, vxc = ni.nr_rks(mol, mf_df.grids, mf_df.xc, dm_np)
+
+        # J/K assembly (matches pyscf.dft.rks.get_veff exactly).
+        # direct_scf=False on DF objects, so incremental_jk is always False.
+        if not ni.libxc.is_hybrid_xc(mf_df.xc):
+            vk = None
+            vj = mf_df.get_j(mol, dm_np, hermi)
+            vxc = vxc + vj
+        else:
+            omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf_df.xc, spin=mol.spin)
+            if omega == 0:
+                vj, vk = mf_df.get_jk(mol, dm_np, hermi)
+                vk *= hyb
+            elif alpha == 0:
+                vj = mf_df.get_j(mol, dm_np, hermi)
+                vk = mf_df.get_k(mol, dm_np, hermi, omega=-omega)
+                vk *= hyb
+            elif hyb == 0:
+                vj = mf_df.get_j(mol, dm_np, hermi)
+                vk = mf_df.get_k(mol, dm_np, hermi, omega=omega)
+                vk *= alpha
+            else:
+                vj, vk = mf_df.get_jk(mol, dm_np, hermi)
+                vk *= hyb
+                vklr = mf_df.get_k(mol, dm_np, hermi, omega=omega)
+                vklr *= (alpha - hyb)
+                vk += vklr
+            vxc += vj - vk * .5
+            if ground_state:
+                exc -= np.einsum('ij,ji', dm_np, vk).real * .5 * .5
+
+        if ground_state:
+            ecoul = np.einsum('ij,ji', dm_np, vj).real * .5
+        else:
+            ecoul = None
+
+        vxc = _tag_array(vxc, ecoul=ecoul, exc=exc, vj=vj, vk=vk)
+        return vxc
+
+    mf_df.get_veff = _metal_get_veff
+
+
 def _patch_df_with_metal_jk(mf_df):
     """Replace the DF object's get_jk with Metal GPU f32 engine.
 
@@ -158,8 +250,19 @@ def _patch_df_with_metal_jk(mf_df):
 
     dfobj.get_jk = _metal_get_jk
     dfobj.reset = _metal_reset
-    if mf_df.conv_tol < 1e-5:
-        mf_df.conv_tol = 1e-5
+
+    # Relax convergence threshold to match f32 noise floor.
+    # Metal J/K produce Fock matrices with ~1e-5 element-wise noise; at the
+    # true minimum the Metal gradient norm floor is ~1e-2 (larger molecules)
+    # so conv_tol_grad=sqrt(conv_tol)=0.01 is the tightest achievable.
+    # A final f64 energy evaluation restores accuracy if needed.
+    if mf_df.conv_tol < 1e-4:
+        mf_df.conv_tol = 1e-4
+
+    # For DF-RKS: route XC evaluation through the Metal GPU engine.
+    # UKS and DF-HF fall through (UKS: no nr_uks_metal yet; HF: no XC).
+    if hasattr(mf_df, 'xc') and type(mf_df).__name__ == 'DFRKS':
+        _patch_dft_veff_metal(mf_df)
 
     # Override nuc_grad_method and Hessian to do f64 refinement first
     _original_ngm = mf_df.nuc_grad_method

@@ -370,20 +370,21 @@ def _prepare_shell_data(mol):
 
     exps_gpu = mx.array(np.concatenate(all_exps))
     coeffs_gpu = mx.array(np.concatenate(all_coeffs))
-    return shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping
+    shell_data_gpu = mx.array(shell_data.ravel())
+    return shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping, shell_data_gpu
 
 
-def _eval_ao_batch_gpu(mol, coords, deriv, shell_data, exps_gpu, coeffs_gpu,
+def _eval_ao_batch_gpu(mol, gridx_gpu, gridy_gpu, gridz_gpu, deriv,
+                       shell_data_gpu, exps_gpu, coeffs_gpu,
                        ncart_total, shell_mapping, ngrids):
     """Evaluate AOs for a grid batch on Metal GPU. Returns mx.array (stays on GPU).
 
+    Args:
+        gridx_gpu, gridy_gpu, gridz_gpu: MLX float32 arrays for this batch.
+        shell_data_gpu: Pre-uploaded shell metadata (MLX array).
+
     Returns: (nao, ngrids) for deriv=0, (4, nao, ngrids) for deriv=1.
     """
-    coords = np.asarray(coords)
-    gridx = mx.array(coords[:, 0].astype(np.float32))
-    gridy = mx.array(coords[:, 1].astype(np.float32))
-    gridz = mx.array(coords[:, 2].astype(np.float32))
-    shell_data_gpu = mx.array(shell_data.ravel())
     nshells = mol.nbas
     nao = mol.nao
     cart = mol.cart
@@ -401,7 +402,7 @@ def _eval_ao_batch_gpu(mol, coords, deriv, shell_data, exps_gpu, coeffs_gpu,
                     ('ncart_total', ncart_total)]
 
     result = kernel(
-        inputs=[gridx, gridy, gridz, exps_gpu, coeffs_gpu, shell_data_gpu],
+        inputs=[gridx_gpu, gridy_gpu, gridz_gpu, exps_gpu, coeffs_gpu, shell_data_gpu],
         grid=(grid_x, nshells, 1),
         threadgroup=(THREADS_X, 1, 1),
         output_shapes=[(ncomp * ncart_total * ngrids,)],
