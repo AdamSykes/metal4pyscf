@@ -197,6 +197,179 @@ _eval_ao_deriv1_kernel = mx.fast.metal_kernel(
 )
 
 
+# ---------------------------------------------------------------------------
+# Deriv=2 kernel: values + 3 first derivs + 6 second derivs
+# Output layout (10 blocks of ncart_total*ngrids):
+#   [val, dx, dy, dz, dxx, dxy, dxz, dyy, dyz, dzz]
+# matching PySCF eval_ao(deriv=2) component ordering.
+#
+# Envelope g = fac * Sum_p c_p exp(-a_p r^2):
+#   gx   = -2x * ce_a;   gy = -2y * ce_a;   gz = -2z * ce_a
+#   gxx  = 4x^2 * ce_a2 - 2*ce_a          (similarly yy, zz)
+#   gxy  = 4xy  * ce_a2                   (similarly xz, yz)
+# where
+#   ce    = fac * Sum_p c_p exp(-a_p r^2)
+#   ce_a  = fac * Sum_p c_p a_p   exp(-a_p r^2)
+#   ce_a2 = fac * Sum_p c_p a_p^2 exp(-a_p r^2)
+# For an AO f = P(x,y,z) * g the product rule gives:
+#   f     = P*ce
+#   f_i   = P_i*ce + P*g_i
+#   f_ii  = P_ii*ce + 2*P_i*g_i + P*g_ii
+#   f_ij  = P_ij*ce + P_i*g_j + P_j*g_i + P*g_ij   (i != j)
+# ---------------------------------------------------------------------------
+
+def _build_deriv2_source():
+    """Generate the per-shell deriv=2 Metal source for l=0..3."""
+    # (P, Px, Py, Pz, Pxx, Pxy, Pxz, Pyy, Pyz, Pzz) per Cartesian component.
+    # Ordering within each l matches _EVAL_AO_SOURCE above.
+    components = {
+        0: [('1.0f', '0.0f', '0.0f', '0.0f',
+             '0.0f', '0.0f', '0.0f', '0.0f', '0.0f', '0.0f')],
+        1: [('x', '1.0f', '0.0f', '0.0f',
+             '0.0f', '0.0f', '0.0f', '0.0f', '0.0f', '0.0f'),
+            ('y', '0.0f', '1.0f', '0.0f',
+             '0.0f', '0.0f', '0.0f', '0.0f', '0.0f', '0.0f'),
+            ('z', '0.0f', '0.0f', '1.0f',
+             '0.0f', '0.0f', '0.0f', '0.0f', '0.0f', '0.0f')],
+        2: [('x*x', '2.0f*x', '0.0f',   '0.0f',
+             '2.0f', '0.0f',  '0.0f',  '0.0f',  '0.0f',  '0.0f'),
+            ('x*y', 'y',      'x',      '0.0f',
+             '0.0f', '1.0f',  '0.0f',  '0.0f',  '0.0f',  '0.0f'),
+            ('x*z', 'z',      '0.0f',   'x',
+             '0.0f', '0.0f',  '1.0f',  '0.0f',  '0.0f',  '0.0f'),
+            ('y*y', '0.0f',   '2.0f*y', '0.0f',
+             '0.0f', '0.0f',  '0.0f',  '2.0f',  '0.0f',  '0.0f'),
+            ('y*z', '0.0f',   'z',      'y',
+             '0.0f', '0.0f',  '0.0f',  '0.0f',  '1.0f',  '0.0f'),
+            ('z*z', '0.0f',   '0.0f',   '2.0f*z',
+             '0.0f', '0.0f',  '0.0f',  '0.0f',  '0.0f',  '2.0f')],
+        3: [('x*x*x', '3.0f*x*x', '0.0f',     '0.0f',
+             '6.0f*x', '0.0f',    '0.0f',     '0.0f',     '0.0f',     '0.0f'),
+            ('x*x*y', '2.0f*x*y', 'x*x',      '0.0f',
+             '2.0f*y', '2.0f*x',  '0.0f',     '0.0f',     '0.0f',     '0.0f'),
+            ('x*x*z', '2.0f*x*z', '0.0f',     'x*x',
+             '2.0f*z', '0.0f',    '2.0f*x',   '0.0f',     '0.0f',     '0.0f'),
+            ('x*y*y', 'y*y',      '2.0f*x*y', '0.0f',
+             '0.0f',   '2.0f*y',  '0.0f',     '2.0f*x',   '0.0f',     '0.0f'),
+            ('x*y*z', 'y*z',      'x*z',      'x*y',
+             '0.0f',   'z',       'y',        '0.0f',     'x',        '0.0f'),
+            ('x*z*z', 'z*z',      '0.0f',     '2.0f*x*z',
+             '0.0f',   '0.0f',    '2.0f*z',   '0.0f',     '0.0f',     '2.0f*x'),
+            ('y*y*y', '0.0f',     '3.0f*y*y', '0.0f',
+             '0.0f',   '0.0f',    '0.0f',     '6.0f*y',   '0.0f',     '0.0f'),
+            ('y*y*z', '0.0f',     '2.0f*y*z', 'y*y',
+             '0.0f',   '0.0f',    '0.0f',     '2.0f*z',   '2.0f*y',   '0.0f'),
+            ('y*z*z', '0.0f',     'z*z',      '2.0f*y*z',
+             '0.0f',   '0.0f',    '0.0f',     '0.0f',     '2.0f*z',   '2.0f*y'),
+            ('z*z*z', '0.0f',     '0.0f',     '3.0f*z*z',
+             '0.0f',   '0.0f',    '0.0f',     '0.0f',     '0.0f',     '6.0f*z')],
+    }
+
+    def term(coef, body):
+        if coef == '0.0f':
+            return None
+        if coef == '1.0f':
+            return body
+        return f'({coef})*{body}'
+
+    def term2(coef, body):
+        if coef == '0.0f':
+            return None
+        if coef == '1.0f':
+            return f'2.0f*{body}'
+        return f'2.0f*({coef})*{body}'
+
+    def plus(*parts):
+        parts = [p for p in parts if p is not None]
+        if not parts:
+            return '0.0f'
+        return ' + '.join(parts)
+
+    lines = []
+    for l in sorted(components):
+        kw = 'if' if l == 0 else 'else if'
+        lines.append(f'    {kw} (ang == {l}) {{')
+        for i, (P, Px, Py, Pz, Pxx, Pxy, Pxz, Pyy, Pyz, Pzz) in enumerate(components[l]):
+            val = plus(term(P, 'ce'))
+            fx  = plus(term(Px, 'ce'), term(P, 'gx'))
+            fy  = plus(term(Py, 'ce'), term(P, 'gy'))
+            fz  = plus(term(Pz, 'ce'), term(P, 'gz'))
+            fxx = plus(term(Pxx, 'ce'), term2(Px, 'gx'), term(P, 'gxx'))
+            fyy = plus(term(Pyy, 'ce'), term2(Py, 'gy'), term(P, 'gyy'))
+            fzz = plus(term(Pzz, 'ce'), term2(Pz, 'gz'), term(P, 'gzz'))
+            fxy = plus(term(Pxy, 'ce'), term(Px, 'gy'), term(Py, 'gx'), term(P, 'gxy'))
+            fxz = plus(term(Pxz, 'ce'), term(Px, 'gz'), term(Pz, 'gx'), term(P, 'gxz'))
+            fyz = plus(term(Pyz, 'ce'), term(Py, 'gz'), term(Pz, 'gy'), term(P, 'gyz'))
+            outs = [val, fx, fy, fz, fxx, fxy, fxz, fyy, fyz, fzz]
+            for k, expr in enumerate(outs):
+                lines.append(f'        GTO({k},{i}) = {expr};')
+        lines.append('    }')
+    return '\n'.join(lines)
+
+
+_EVAL_AO_DERIV2_BODY = _build_deriv2_source()
+
+_EVAL_AO_DERIV2_SOURCE = '''
+uint gid = thread_position_in_grid.x;
+uint sid = thread_position_in_grid.y;
+if (gid >= ngrids || sid >= nshells) return;
+
+float acx = shell_data[sid*8+0];
+float acy = shell_data[sid*8+1];
+float acz = shell_data[sid*8+2];
+float fac = shell_data[sid*8+3];
+int nprim_s = (int)shell_data[sid*8+4];
+int ao_off_s = (int)shell_data[sid*8+5];
+int exp_off = (int)shell_data[sid*8+6];
+int ang = (int)shell_data[sid*8+7];
+
+float x = gridx[gid] - acx;
+float y = gridy[gid] - acy;
+float z = gridz[gid] - acz;
+float rr = x*x + y*y + z*z;
+
+float ce = 0.0f, cea = 0.0f, cea2 = 0.0f;
+for (int p = 0; p < nprim_s; p++) {
+    float c = coeffs[exp_off+p];
+    float a = exps[exp_off+p];
+    float e = exp(-a * rr);
+    float ce_p = c * e;
+    ce   += ce_p;
+    cea  += ce_p * a;
+    cea2 += ce_p * a * a;
+}
+ce   *= fac;
+cea  *= fac;
+cea2 *= fac;
+
+float gx  = -2.0f * x * cea;
+float gy  = -2.0f * y * cea;
+float gz  = -2.0f * z * cea;
+float gxx = 4.0f * x * x * cea2 - 2.0f * cea;
+float gyy = 4.0f * y * y * cea2 - 2.0f * cea;
+float gzz = 4.0f * z * z * cea2 - 2.0f * cea;
+float gxy = 4.0f * x * y * cea2;
+float gxz = 4.0f * x * z * cea2;
+float gyz = 4.0f * y * z * cea2;
+
+uint s = ngrids;
+uint blk = ncart_total * s;
+// 10 output blocks: val, dx, dy, dz, dxx, dxy, dxz, dyy, dyz, dzz
+#define GTO(k,i) out[(k)*blk + (ao_off_s+(i))*s + gid]
+
+''' + _EVAL_AO_DERIV2_BODY + '''
+
+#undef GTO
+'''
+
+_eval_ao_deriv2_kernel = mx.fast.metal_kernel(
+    name='eval_ao_deriv2',
+    input_names=['gridx', 'gridy', 'gridz', 'exps', 'coeffs', 'shell_data'],
+    output_names=['out'],
+    source=_EVAL_AO_DERIV2_SOURCE,
+)
+
+
 def eval_ao_metal(mol, coords, deriv=0):
     """Evaluate AO basis functions on grid points using Metal GPU.
 
@@ -209,8 +382,8 @@ def eval_ao_metal(mol, coords, deriv=0):
         deriv=0: (ngrids, nao) array
         deriv=1: (4, ngrids, nao) array [values, dx, dy, dz]
     """
-    if deriv > 1:
-        raise NotImplementedError('Metal eval_ao supports deriv=0 and deriv=1')
+    if deriv > 2:
+        raise NotImplementedError('Metal eval_ao supports deriv=0, 1, 2')
 
     coords = np.asarray(coords, dtype=np.float64, order='C')
     ngrids = coords.shape[0]
@@ -261,14 +434,18 @@ def eval_ao_metal(mol, coords, deriv=0):
     THREADS_X = 256
     grid_x = ((ngrids + THREADS_X - 1) // THREADS_X) * THREADS_X
 
-    ncomp = 4 if deriv == 1 else 1
+    ncomp = {0: 1, 1: 4, 2: 10}[deriv]
     output_size = ncomp * ncart_total * ngrids
 
     if deriv == 0:
         kernel = _eval_ao_kernel
         template = [('ngrids', ngrids), ('nshells', nshells)]
-    else:
+    elif deriv == 1:
         kernel = _eval_ao_deriv1_kernel
+        template = [('ngrids', ngrids), ('nshells', nshells),
+                    ('ncart_total', ncart_total)]
+    else:
+        kernel = _eval_ao_deriv2_kernel
         template = [('ngrids', ngrids), ('nshells', nshells),
                     ('ncart_total', ncart_total)]
 
@@ -284,7 +461,7 @@ def eval_ao_metal(mol, coords, deriv=0):
     if deriv == 0:
         ao_cart_gpu = result[0].reshape(ncart_total, ngrids)  # (ncart, ngrids)
     else:
-        ao_cart_gpu = result[0].reshape(4, ncart_total, ngrids)  # (4, ncart, ngrids)
+        ao_cart_gpu = result[0].reshape(ncomp, ncart_total, ngrids)  # (ncomp, ncart, ngrids)
 
     if not cart and ncart_total != nao:
         # Cart-to-spherical on Metal GPU
@@ -317,11 +494,11 @@ def eval_ao_metal(mol, coords, deriv=0):
             mx.eval(ao_sph_gpu)
             return np.array(ao_sph_gpu).T.astype(np.float64)
         else:
-            # Apply c2s to each of the 4 components
+            # Apply c2s to each component
             result_parts = []
-            for comp in range(4):
+            for comp in range(ncomp):
                 result_parts.append(_apply_c2s(ao_cart_gpu[comp]))
-            ao_sph_gpu = mx.stack(result_parts)  # (4, nao, ngrids)
+            ao_sph_gpu = mx.stack(result_parts)  # (ncomp, nao, ngrids)
             mx.eval(ao_sph_gpu)
             return np.array(ao_sph_gpu).transpose(0, 2, 1).astype(np.float64)
 
@@ -391,13 +568,17 @@ def _eval_ao_batch_gpu(mol, gridx_gpu, gridy_gpu, gridz_gpu, deriv,
 
     THREADS_X = 256
     grid_x = ((ngrids + THREADS_X - 1) // THREADS_X) * THREADS_X
-    ncomp = 4 if deriv == 1 else 1
+    ncomp = {0: 1, 1: 4, 2: 10}[deriv]
 
     if deriv == 0:
         kernel = _eval_ao_kernel
         template = [('ngrids', ngrids), ('nshells', nshells)]
-    else:
+    elif deriv == 1:
         kernel = _eval_ao_deriv1_kernel
+        template = [('ngrids', ngrids), ('nshells', nshells),
+                    ('ncart_total', ncart_total)]
+    else:
+        kernel = _eval_ao_deriv2_kernel
         template = [('ngrids', ngrids), ('nshells', nshells),
                     ('ncart_total', ncart_total)]
 
@@ -413,7 +594,7 @@ def _eval_ao_batch_gpu(mol, gridx_gpu, gridy_gpu, gridz_gpu, deriv,
     if deriv == 0:
         ao_cart = result[0].reshape(ncart_total, ngrids)
     else:
-        ao_cart = result[0].reshape(4, ncart_total, ngrids)
+        ao_cart = result[0].reshape(ncomp, ncart_total, ngrids)
 
     # Cart-to-spherical on GPU
     if not cart and ncart_total != nao:
@@ -431,6 +612,6 @@ def _eval_ao_batch_gpu(mol, gridx_gpu, gridy_gpu, gridz_gpu, deriv,
         if deriv == 0:
             return _apply_c2s(ao_cart)
         else:
-            return mx.stack([_apply_c2s(ao_cart[c]) for c in range(4)])
+            return mx.stack([_apply_c2s(ao_cart[c]) for c in range(ncomp)])
 
     return ao_cart
