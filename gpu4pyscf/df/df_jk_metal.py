@@ -215,12 +215,76 @@ def _single_jk(tensors, dm_2d, nao, naux, with_j, with_k, hermi):
     return vj, vk
 
 
+def _batched_jk(tensors, dms, nao, naux, with_j, with_k, hermi):
+    """Batched J/K for stacked density matrices of shape (n, nao, nao).
+
+    J: packs all dms and does a single matmul-pair instead of n matvec-pairs.
+    K: stacks the Cholesky-decomposed density factors and does a single
+    half-transform (cderi @ L_combined), then per-spin K formation.
+
+    For UKS (n=2) this saves one half-transform and replaces matvecs with
+    matmuls on the J side.
+    """
+    n = dms.shape[0]
+    vjs = vks = None
+    idx = np.tril_indices(nao)
+    off_diag_mask = (idx[0] != idx[1])
+    npairs = nao * (nao + 1) // 2
+
+    if with_j:
+        # Pack all dms: (n, npairs) → transpose to (npairs, n) for matmul
+        dm_packed = np.empty((npairs, n), dtype=np.float32)
+        for i in range(n):
+            dp = dms[i][idx].copy()
+            dp[off_diag_mask] *= 2.0
+            dm_packed[:, i] = dp.astype(np.float32)
+        dm_packed_gpu = mx.array(dm_packed)
+        rho_q = tensors.cderi_tril_gpu @ dm_packed_gpu           # (naux, n)
+        vj_packed = mx.transpose(tensors.cderi_tril_gpu) @ rho_q  # (npairs, n)
+        mx.eval(vj_packed)
+        vj_f64 = np.array(vj_packed).astype(np.float64)
+        vjs = np.zeros((n, nao, nao))
+        for i in range(n):
+            vjs[i][idx] = vj_f64[:, i]
+            vjs[i] = vjs[i] + vjs[i].T
+            np.fill_diagonal(vjs[i], np.diag(vjs[i]) * 0.5)
+
+    if with_k:
+        # Stack L factors across all dms into one half-transform
+        Ls = [_get_occ_coeff(dms[i]) for i in range(n)]
+        noccs = [L.shape[1] for L in Ls]
+        nocc_total = sum(noccs)
+        L_combined = np.concatenate(Ls, axis=1).astype(np.float32)
+        L_gpu = mx.array(L_combined)
+        # Y_all: (naux*nao, nocc_total) — single matmul instead of n of them
+        Y_all = tensors.cderi_full_gpu.reshape(naux * nao, nao) @ L_gpu
+        # (naux, nao, nocc_total) → (nao, naux, nocc_total)
+        Y_all_t = mx.transpose(Y_all.reshape(naux, nao, nocc_total), axes=(1, 0, 2))
+        vks = np.zeros((n, nao, nao))
+        offset = 0
+        for i in range(n):
+            nocc_i = noccs[i]
+            Y_i = Y_all_t[:, :, offset:offset+nocc_i].reshape(nao, -1)
+            K_gpu = Y_i @ mx.transpose(Y_i)
+            mx.eval(K_gpu)
+            K = np.array(K_gpu).astype(np.float64)
+            if hermi:
+                K = (K + K.T) * 0.5
+            vks[i] = K
+            offset += nocc_i
+
+    return vjs, vks
+
+
 def get_jk_metal(dfobj, dm, hermi=1, with_j=True, with_k=True):
     """Compute DF J/K on Metal GPU.
 
     Handles both 2D (nao,nao) RHF/RKS density and 3D (n,nao,nao) stacks
     for UKS (alpha/beta) or other multi-density cases. First call builds
     and caches GPU tensors; subsequent calls reuse them.
+
+    For 3D inputs the J/K computation is batched: single matmul-pair for
+    J across all spins, single half-transform for K.
     """
     log = logger.new_logger(dfobj.mol, dfobj.verbose)
     t0 = log.init_timer()
@@ -233,13 +297,7 @@ def get_jk_metal(dfobj, dm, hermi=1, with_j=True, with_k=True):
     if dm.ndim == 2:
         vj, vk = _single_jk(tensors, dm, nao, naux, with_j, with_k, hermi)
     elif dm.ndim == 3:
-        vjs, vks = [], []
-        for i in range(dm.shape[0]):
-            vj_i, vk_i = _single_jk(tensors, dm[i], nao, naux, with_j, with_k, hermi)
-            if with_j: vjs.append(vj_i)
-            if with_k: vks.append(vk_i)
-        vj = np.stack(vjs) if with_j else None
-        vk = np.stack(vks) if with_k else None
+        vj, vk = _batched_jk(tensors, dm, nao, naux, with_j, with_k, hermi)
     else:
         raise ValueError(f'get_jk_metal: dm must be 2D or 3D, got ndim={dm.ndim}')
 
