@@ -141,3 +141,59 @@ def install_metal_grad_patch():
 
     _df_grad_rhf._cho_solve_rhojk = _dispatcher
     _patched = True
+
+
+_vxc_grad_patched = False
+
+
+def install_metal_vxc_grad_patch():
+    """Monkey-patch ``pyscf.grad.rks.get_vxc`` to dispatch to the Metal
+    GPU XC gradient kernel when the numint object carries a
+    ``_metal_enabled`` marker, else fall through to PySCF CPU.
+
+    The marker is set on ``mf._numint`` during ``_patch_df_with_metal_jk``
+    for DFRKS (Phase 3 scope). MGGA / UKS grad are not yet supported;
+    those xctypes always fall through to CPU.
+
+    Idempotent: safe to call multiple times.
+    """
+    global _vxc_grad_patched
+    if _vxc_grad_patched:
+        return
+    from pyscf.grad import rks as _grad_rks
+
+    _original_get_vxc = _grad_rks.get_vxc
+
+    def _get_vxc_dispatcher(ni, mol, grids, xc_code, dms, relativity=0,
+                            hermi=1, max_memory=2000, verbose=None):
+        if not getattr(ni, '_metal_enabled', False):
+            return _original_get_vxc(ni, mol, grids, xc_code, dms,
+                                     relativity, hermi, max_memory, verbose)
+        xctype = ni._xc_type(xc_code)
+        if xctype not in ('LDA', 'GGA'):
+            return _original_get_vxc(ni, mol, grids, xc_code, dms,
+                                     relativity, hermi, max_memory, verbose)
+        # RKS only for Phase 3 — dms is (nao, nao). UKS would pass (2, nao, nao).
+        dms_arr = np.asarray(dms)
+        if dms_arr.ndim == 3:
+            return _original_get_vxc(ni, mol, grids, xc_code, dms,
+                                     relativity, hermi, max_memory, verbose)
+        # Delegate to Metal backend via isolated loader to avoid pulling
+        # gpu4pyscf.dft.__init__ through its CuPy-gated imports.
+        import importlib.util as _ilu, os as _os, sys as _sys
+        _modname = 'gpu4pyscf_numint_metal_loader'
+        if _modname in _sys.modules:
+            _mod = _sys.modules[_modname]
+        else:
+            _path = _os.path.join(
+                _os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))),
+                'dft', 'numint_metal.py')
+            _spec = _ilu.spec_from_file_location(_modname, _path)
+            _mod = _ilu.module_from_spec(_spec)
+            _sys.modules[_modname] = _mod
+            _spec.loader.exec_module(_mod)
+        return _mod.nr_rks_grad_metal(ni, mol, grids, xc_code, dms_arr,
+                                      max_memory)
+
+    _grad_rks.get_vxc = _get_vxc_dispatcher
+    _vxc_grad_patched = True

@@ -639,3 +639,124 @@ def _batched_rho_vxc_uks(mol, coords, dm_a, dm_b, weights, ni, xc_code, xctype,
     vmat = np.stack([vmat_a, vmat_b])
     nelec = np.array([nelec_a, nelec_b])
     return nelec, excsum, vmat
+
+
+def _batched_vxc_grad(mol, coords, dm, weights, ni, xc_code, xctype,
+                      shell_data, exps_gpu, coeffs_gpu, ncart_total,
+                      shell_mapping, shell_data_gpu):
+    """Metal GPU XC nuclear-gradient contraction (RKS).
+
+    Computes the bra-side vmat[x, mu, nu] used by pyscf.grad.rks.get_vxc /
+    _gga_grad_sum_. The caller multiplies by 2 (for bra+ket) and contracts
+    with the density matrix to get the atomic forces. Returned with the
+    PySCF sign convention: -vmat.
+
+    For GGA the contraction consumes ao deriv=2 (10 components); for LDA it
+    needs deriv=1 (4 components).
+
+    Returns:
+        (None, -vmat) where vmat is (3, nao, nao) f64.
+    """
+    if xctype not in ('LDA', 'GGA'):
+        raise NotImplementedError(
+            f'_batched_vxc_grad: xctype={xctype} not supported '
+            '(Phase 3 covers LDA/GGA)')
+
+    nao = mol.nao
+    ngrids = coords.shape[0]
+    dm_gpu = mx.array(np.asarray(dm, dtype=np.float32))
+    ao_deriv = 2 if xctype == 'GGA' else 1
+
+    gridx_all = mx.array(coords[:, 0].astype(np.float32))
+    gridy_all = mx.array(coords[:, 1].astype(np.float32))
+    gridz_all = mx.array(coords[:, 2].astype(np.float32))
+
+    vmat_gpu = mx.zeros((3, nao, nao), dtype=mx.float32)
+    BATCH = 20000
+
+    for p0 in range(0, ngrids, BATCH):
+        p1 = min(p0 + BATCH, ngrids)
+        ng = p1 - p0
+        wt = weights[p0:p1]
+
+        # ao_gpu shape: (ncomp, nao, ng), f32
+        ao_gpu = _eval_ao_batch_gpu(
+            mol, gridx_all[p0:p1], gridy_all[p0:p1], gridz_all[p0:p1],
+            ao_deriv, shell_data_gpu, exps_gpu, coeffs_gpu,
+            ncart_total, shell_mapping, ng)
+
+        # Compute rho on GPU, then libxc on CPU for vxc.
+        ao_val = ao_gpu[0]                  # (nao, ng)
+        tmp = dm_gpu @ ao_val               # (nao, ng) = D . ao
+        if xctype == 'LDA':
+            rho_gpu = mx.sum(ao_val * tmp, axis=0)
+            mx.eval(rho_gpu)
+            rho = np.array(rho_gpu, dtype=np.float64)
+        else:  # GGA
+            rho0 = mx.sum(ao_val * tmp, axis=0)
+            rho1 = 2.0 * mx.sum(ao_gpu[1] * tmp, axis=0)
+            rho2 = 2.0 * mx.sum(ao_gpu[2] * tmp, axis=0)
+            rho3 = 2.0 * mx.sum(ao_gpu[3] * tmp, axis=0)
+            mx.eval(rho0, rho1, rho2, rho3)
+            rho = np.empty((4, ng), dtype=np.float64)
+            rho[0] = np.array(rho0); rho[1] = np.array(rho1)
+            rho[2] = np.array(rho2); rho[3] = np.array(rho3)
+
+        vxc = ni.eval_xc_eff(xc_code, rho, deriv=1, xctype=xctype, spin=0)[1]
+        wv = wt * vxc                       # LDA: (1, ng); GGA: (4, ng)
+
+        if xctype == 'LDA':
+            # vmat[x, mu, nu] += sum_p v_rho[p] . ao[1+x, mu, p] . ao[0, nu, p]
+            wv0 = mx.array(wv[0].astype(np.float32))
+            aow = ao_val * wv0[None, :]     # (nao, ng)
+            vm0 = ao_gpu[1] @ mx.transpose(aow)
+            vm1 = ao_gpu[2] @ mx.transpose(aow)
+            vm2 = ao_gpu[3] @ mx.transpose(aow)
+        else:
+            # GGA: wv[0] *= 0.5 halves v_rho to avoid double-counting,
+            # because v_rho appears in both Part 1 (k=0) and Part 2 (d=0).
+            wv = wv.copy()
+            wv[0] *= 0.5
+            w0 = mx.array(wv[0].astype(np.float32))
+            w1 = mx.array(wv[1].astype(np.float32))
+            w2 = mx.array(wv[2].astype(np.float32))
+            w3 = mx.array(wv[3].astype(np.float32))
+
+            # Part 1: aow_1[mu, p] = sum_k wv[k, p] . ao[k, mu, p]  (k=0..3)
+            aow_1 = (ao_gpu[0] * w0[None, :]
+                     + ao_gpu[1] * w1[None, :]
+                     + ao_gpu[2] * w2[None, :]
+                     + ao_gpu[3] * w3[None, :])
+            # vmat[x, mu, nu] += sum_p ao[1+x, mu, p] . aow_1[nu, p]
+            vm0 = ao_gpu[1] @ mx.transpose(aow_1)
+            vm1 = ao_gpu[2] @ mx.transpose(aow_1)
+            vm2 = ao_gpu[3] @ mx.transpose(aow_1)
+
+            # Part 2: aow_A[mu, p] = v_rho . ao[1+A, mu, p]
+            #                      + sum_B v_sigma_B . ao[mixed(A,B), mu, p]
+            # Index map for deriv=2: val=0, dx=1, dy=2, dz=3,
+            #   dxx=4, dxy=5, dxz=6, dyy=7, dyz=8, dzz=9
+            # (XX,XY,XZ)=(4,5,6); (YX,YY,YZ)=(5,7,8); (ZX,ZY,ZZ)=(6,8,9)
+            aow_X = (ao_gpu[1] * w0[None, :]
+                     + ao_gpu[4] * w1[None, :]
+                     + ao_gpu[5] * w2[None, :]
+                     + ao_gpu[6] * w3[None, :])
+            aow_Y = (ao_gpu[2] * w0[None, :]
+                     + ao_gpu[5] * w1[None, :]
+                     + ao_gpu[7] * w2[None, :]
+                     + ao_gpu[8] * w3[None, :])
+            aow_Z = (ao_gpu[3] * w0[None, :]
+                     + ao_gpu[6] * w1[None, :]
+                     + ao_gpu[8] * w2[None, :]
+                     + ao_gpu[9] * w3[None, :])
+            # vmat[x, mu, nu] += sum_p aow_A[mu, p] . ao[0, nu, p]
+            vm0 = vm0 + aow_X @ mx.transpose(ao_val)
+            vm1 = vm1 + aow_Y @ mx.transpose(ao_val)
+            vm2 = vm2 + aow_Z @ mx.transpose(ao_val)
+
+        vmat_gpu = vmat_gpu + mx.stack([vm0, vm1, vm2], axis=0)
+        mx.eval(vmat_gpu)
+
+    vmat = np.array(vmat_gpu, dtype=np.float64)
+    # PySCF convention: nabla_X = -nabla_x.
+    return None, -vmat
