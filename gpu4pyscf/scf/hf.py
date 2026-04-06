@@ -422,11 +422,11 @@ def _patch_df_with_metal_jk(mf_df):
         mf_df.TDA = _refined_tda
 
 def _refine_to_f64(mf):
-    """Refine f32-converged SCF to f64 before gradient computation.
+    """Refine f32-converged SCF to f64 before gradient/Hessian.
 
-    Restores PySCF f64 J/K on any patched DF object, then runs a few
-    SCF cycles from the Metal-converged density. Works on any mf object
-    including DF-wrapped ones (DFRKS, DFRHF, etc.).
+    Runs a few f64 SCF cycles from the f32-converged density to obtain
+    f64-precision mo_coeff / mo_energy. The f32 density is already close
+    to the variational minimum, so 3 cycles suffice (vs ~8-10 from scratch).
     """
     if not getattr(mf, 'converged', False):
         return
@@ -439,7 +439,7 @@ def _refine_to_f64(mf):
     mf.mo_coeff = None
     mf.mo_occ = None
     saved_tol, mf.conv_tol = mf.conv_tol, 1e-10
-    saved_max, mf.max_cycle = mf.max_cycle, 10
+    saved_max, mf.max_cycle = mf.max_cycle, 3
     mf.kernel(dm0=dm0)
     mf.conv_tol = saved_tol
     mf.max_cycle = saved_max
