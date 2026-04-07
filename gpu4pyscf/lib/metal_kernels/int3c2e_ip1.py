@@ -35,6 +35,35 @@ from gpu4pyscf.lib.metal_kernels.rys_jk_metal import (
 )
 from gpu4pyscf.lib.metal_kernels.rys_jk import _rys_from_boys
 from pyscf.gto.moleintor import getints, make_cintopt
+import numba as nb
+
+
+@nb.njit(cache=True)
+def _accumulate_cart_nb(int_buf, offsets, m_i0, m_j0, m_k0, m_ts, m_tc,
+                        m_nfi, m_nfj, m_nfk, m_nout, m_li, m_lj, m_lk,
+                        fac_tbl, out):
+    """Numba-JIT Phase C: sum primitives per shell triple into output tensor."""
+    n_meta = len(m_i0)
+    for m in range(n_meta):
+        i0 = m_i0[m]; j0 = m_j0[m]; k0 = m_k0[m]
+        t_start = m_ts[m]; t_count = m_tc[m]
+        nfi = m_nfi[m]; nfj = m_nfj[m]; nfk = m_nfk[m]
+        n_out = m_nout[m]
+        fac = fac_tbl[m_li[m]] * fac_tbl[m_lj[m]] * fac_tbl[m_lk[m]]
+        comp_stride = nfi * nfj * nfk
+        off_start = offsets[t_start]
+        # Sum all primitive contributions
+        for idx in range(n_out):
+            val = 0.0
+            for t in range(t_count):
+                val += int_buf[off_start + t * n_out + idx]
+            comp = idx // comp_stride
+            rem = idx - comp * comp_stride
+            fi = rem // (nfj * nfk)
+            rem2 = rem - fi * nfj * nfk
+            fj = rem2 // nfk
+            fk = rem2 - fj * nfk
+            out[comp, i0 + fi, j0 + fj, k0 + fk] -= val * fac
 
 
 # ---------------------------------------------------------------------------
@@ -493,7 +522,7 @@ def _build_3c_tasks(mol, auxmol, shl0_aux, shl1_aux):
         fm = _boys_function_vec(m_max, t_all[nr_mask])
         n_pts = fm.shape[1]
         if nr <= 3:
-            # Use vectorized batch solver (fast)
+            # Use existing vectorized batch solver (proven correct)
             roots_3, weights_3 = _rys_from_boys_batch(nr, fm)
             roots = np.zeros((n_pts, 6), dtype=np.float64)
             weights = np.zeros((n_pts, 6), dtype=np.float64)
@@ -547,7 +576,9 @@ def _build_3c_tasks(mol, auxmol, shl0_aux, shl1_aux):
         tasks[nr_mask, 24:30] = weights.astype(np.float32)
 
     # Build int32 offset array via vectorized cumsum
-    n_out_per = np.array([triple_info[tidx][6] for tidx in task_tidx], dtype=np.int64)
+    # Pre-build lookup: triple_info[tidx][6] → n_out per triple
+    n_out_lookup = np.array([ti[6] for ti in triple_info], dtype=np.int64)
+    n_out_per = n_out_lookup[task_tidx]
     offsets_i64 = np.zeros(n_tasks, dtype=np.int64)
     if n_tasks > 1:
         np.cumsum(n_out_per[:-1], out=offsets_i64[1:])
@@ -682,22 +713,25 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
     ao_loc_c = mol.ao_loc_nr(cart=True)
 
     out_cart = np.zeros((3, nao_cart, nao_cart, naux_slice_c), dtype=np.float64)
-    for ish, jsh, ksh, t_start, t_count, nfi, nfj, nfk, n_out in meta:
-        i0 = ao_loc_c[ish]
-        j0 = ao_loc_c[jsh]
-        k0 = aux_loc_c[ksh] - p0_aux
-        comp_stride = nfi * nfj * nfk
-        # All t_count primitives are contiguous in int_buf
-        off_start = int(offsets[t_start])
-        shell_block = int_buf[off_start:off_start + t_count * n_out].reshape(
-            t_count, n_out).sum(axis=0)
-        li = mol.bas_angular(ish)
-        lj = mol.bas_angular(jsh)
-        lk = auxmol.bas_angular(ksh)
-        fac = _FAC_L[li] * _FAC_L[lj] * _FAC_L[lk]
-        for comp in range(3):
-            block = shell_block[comp*comp_stride:(comp+1)*comp_stride].reshape(nfi, nfj, nfk)
-            out_cart[comp, i0:i0+nfi, j0:j0+nfj, k0:k0+nfk] -= block * fac
+    # Pack meta into arrays for fast Numba or vectorized access
+    n_meta = len(meta)
+    if n_meta > 0:
+        m_i0 = np.array([ao_loc_c[m[0]] for m in meta], dtype=np.int32)
+        m_j0 = np.array([ao_loc_c[m[1]] for m in meta], dtype=np.int32)
+        m_k0 = np.array([aux_loc_c[m[2]] - p0_aux for m in meta], dtype=np.int32)
+        m_ts = np.array([m[3] for m in meta], dtype=np.int32)
+        m_tc = np.array([m[4] for m in meta], dtype=np.int32)
+        m_nfi = np.array([m[5] for m in meta], dtype=np.int32)
+        m_nfj = np.array([m[6] for m in meta], dtype=np.int32)
+        m_nfk = np.array([m[7] for m in meta], dtype=np.int32)
+        m_nout = np.array([m[8] for m in meta], dtype=np.int32)
+        fac_tbl = np.array([_FAC_L[0], _FAC_L[1], _FAC_L[2], _FAC_L[3], _FAC_L[4]])
+        m_li = np.array([mol.bas_angular(m[0]) for m in meta], dtype=np.int32)
+        m_lj = np.array([mol.bas_angular(m[1]) for m in meta], dtype=np.int32)
+        m_lk = np.array([auxmol.bas_angular(m[2]) for m in meta], dtype=np.int32)
+        _accumulate_cart_nb(int_buf, offsets, m_i0, m_j0, m_k0, m_ts, m_tc,
+                            m_nfi, m_nfj, m_nfk, m_nout, m_li, m_lj, m_lk,
+                            fac_tbl, out_cart)
 
     if mol.cart:
         # PySCF getints returns (ncomp, ni, nj, nk) with Fortran-ordered
