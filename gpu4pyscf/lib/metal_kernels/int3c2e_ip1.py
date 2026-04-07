@@ -31,7 +31,7 @@ import numpy as np
 import mlx.core as mx
 from math import pi, sqrt
 from gpu4pyscf.lib.metal_kernels.rys_jk_metal import (
-    _boys_function_vec,
+    _boys_function_vec, _rys_from_boys_batch,
 )
 from gpu4pyscf.lib.metal_kernels.rys_jk import _rys_from_boys
 from pyscf.gto.moleintor import getints, make_cintopt
@@ -278,130 +278,296 @@ def _rys_from_boys_general_batch(nroots, fm):
     return roots, weights
 
 
-def _build_3c_tasks(mol, auxmol, shl0_aux, shl1_aux):
-    """Build task array for int3c2e_ip1 Metal kernel.
+def _precompute_bra_pairs(mol):
+    """Precompute primitive pair data for all orbital shell pairs."""
+    nbas = mol.nbas
+    shell_l = np.array([mol.bas_angular(i) for i in range(nbas)])
+    shell_atom = np.array([mol.bas_atom(i) for i in range(nbas)])
+    coords = np.array([mol.atom_coord(i) for i in range(mol.natm)])
+    shell_R = coords[shell_atom]
+    cache = {}
+    for ish in range(nbas):
+        li = shell_l[ish]
+        if li > 3:
+            continue
+        ai = mol.bas_exp(ish)
+        ci = mol._libcint_ctr_coeff(ish).flatten()
+        Ri = shell_R[ish]
+        ni = len(ai)
+        for jsh in range(nbas):
+            lj = shell_l[jsh]
+            if lj > 3:
+                continue
+            aj = mol.bas_exp(jsh)
+            cj = mol._libcint_ctr_coeff(jsh).flatten()
+            Rj = shell_R[jsh]
+            nj = len(aj)
+            # Cross-product of primitives
+            ai2 = np.repeat(ai, nj)
+            aj2 = np.tile(aj, ni)
+            ci2 = np.repeat(ci, nj)
+            cj2 = np.tile(cj, ni)
+            aij = ai2 + aj2
+            rr = np.dot(Ri - Rj, Ri - Rj)
+            Kab = np.exp(-ai2 * aj2 / aij * rr)
+            P = (ai2[:, None] * Ri + aj2[:, None] * Rj) / aij[:, None]
+            PA = P - Ri
+            coeff_K = ci2 * cj2 * Kab
+            AB = Ri - Rj
+            cache[(ish, jsh)] = (aij, ai2, PA, P, coeff_K, AB)
+    return cache
 
-    Enumerates all primitive triples (pi, pj, pk) for orbital shell pairs
-    (ish, jsh) and aux shells ksh in [shl0_aux, shl1_aux). Computes Boys
-    function and Rys roots/weights on CPU in f64. Packs into TASK_STRIDE
-    float32 task array for GPU.
+
+def _build_3c_tasks(mol, auxmol, shl0_aux, shl1_aux):
+    """Build task array for int3c2e_ip1 Metal kernel (vectorized).
+
+    Three phases:
+      1. Precompute bra shell pairs and enumerate valid shell triples
+      2. Group by (n_bra_prims, n_aux_prims), batch cross-product expansion
+      3. Batch Boys/Rys across all primitives per nroots
 
     Returns:
         tasks: (n_tasks, TASK_STRIDE) float32
-        meta: list of (ish, jsh, ksh, task_start, task_count, nfi, nfj, nfk)
+        offsets: (n_tasks,) int32  — per-task output offset
+        meta: list of (ish, jsh, ksh, task_start, task_count, nfi, nfj, nfk, n_out)
         total_out: total output floats needed
     """
     nbas = mol.nbas
-    tasks_list = []
-    meta = []
-    out_offset = 0
+    pair_cache = _precompute_bra_pairs(mol)
+    shell_l = np.array([mol.bas_angular(i) for i in range(nbas)])
 
+    # Aux shell data
+    aux_l = np.array([auxmol.bas_angular(i) for i in range(auxmol.nbas)])
+    aux_atom = np.array([auxmol.bas_atom(i) for i in range(auxmol.nbas)])
+    aux_coords = np.array([auxmol.atom_coord(i) for i in range(auxmol.natm)])
+    aux_R = aux_coords[aux_atom]
+    aux_exps = [auxmol.bas_exp(i) for i in range(auxmol.nbas)]
+    aux_coeffs = [auxmol._libcint_ctr_coeff(i).flatten() for i in range(auxmol.nbas)]
+
+    # Phase 1: enumerate valid shell triples (lightweight Python loop)
+    valid = []
     for ish in range(nbas):
-        li = mol.bas_angular(ish)
+        li = shell_l[ish]
         if li > 3:
             continue
-        ai_arr = mol.bas_exp(ish)
-        ci_arr = mol._libcint_ctr_coeff(ish).flatten()
-        Ri = mol.atom_coord(mol.bas_atom(ish))
-        npi = len(ai_arr)
-        nfi = _NCART_LUT[li]
-
         for jsh in range(nbas):
-            lj = mol.bas_angular(jsh)
+            lj = shell_l[jsh]
             if lj > 3:
                 continue
-            aj_arr = mol.bas_exp(jsh)
-            cj_arr = mol._libcint_ctr_coeff(jsh).flatten()
-            Rj = mol.atom_coord(mol.bas_atom(jsh))
-            npj = len(aj_arr)
-            nfj = _NCART_LUT[lj]
-            rr_ab = np.dot(Ri - Rj, Ri - Rj)
-            AB = Ri - Rj
-
-            for ksh_idx in range(shl0_aux, shl1_aux):
-                lk = auxmol.bas_angular(ksh_idx)
+            if (ish, jsh) not in pair_cache:
+                continue
+            n_ij = len(pair_cache[(ish, jsh)][0])
+            for ksh in range(shl0_aux, shl1_aux):
+                lk = aux_l[ksh]
                 if lk > 4:
                     continue
-                ak_arr = auxmol.bas_exp(ksh_idx)
-                ck_arr = auxmol._libcint_ctr_coeff(ksh_idx).flatten()
-                Rk = auxmol.atom_coord(auxmol.bas_atom(ksh_idx))
-                npk = len(ak_arr)
-                nfk = _NCART_LUT[lk]
+                n_k = len(aux_exps[ksh])
+                nroots = (li + 1 + lj + lk) // 2 + 1
+                valid.append((ish, jsh, ksh, li, lj, lk, nroots, n_ij, n_k))
 
-                li1 = li + 1
-                nroots = (li1 + lj + lk) // 2 + 1
-                n_out_triple = 3 * nfi * nfj * nfk
-                task_start = len(tasks_list)
-
-                for pi in range(npi):
-                    ai = float(ai_arr[pi])
-                    ci = float(ci_arr[pi])
-                    for pj in range(npj):
-                        aj = float(aj_arr[pj])
-                        cj = float(cj_arr[pj])
-                        aij = ai + aj
-                        eij = np.exp(-ai * aj / aij * rr_ab)
-                        if eij < 1e-14:
-                            continue
-                        P = (ai * Ri + aj * Rj) / aij
-                        PA = P - Ri
-                        coeff_ij = ci * cj * eij
-
-                        for pk in range(npk):
-                            ak = float(ak_arr[pk])
-                            ck = float(ck_arr[pk])
-                            aijk = aij + ak
-                            a0 = aij * ak / aijk
-                            PC = P - Rk
-                            T = a0 * np.dot(PC, PC)
-                            prefac = coeff_ij * ck * 2.0 * PI_5_2 / (aij * ak * sqrt(aijk))
-                            # Don't apply fac_l here; it's applied per-shell in Phase C
-
-                            # Boys function (CPU f64)
-                            fm = _boys_function_vec(2 * nroots - 1, np.array([T]))
-                            rt, wt = _rys_from_boys(nroots, fm[:, 0])
-
-                            task = np.zeros(TASK_STRIDE, dtype=np.float32)
-                            task[0] = aij
-                            task[1] = ak
-                            task[2:5] = PA.astype(np.float32)
-                            task[5:8] = PC.astype(np.float32)
-                            task[8:11] = AB.astype(np.float32)
-                            task[11] = prefac
-                            task[12] = ai
-                            task[13] = li
-                            task[14] = lj
-                            task[15] = lk
-                            # Each primitive gets its OWN output region
-                            # (no atomics, no race conditions)
-                            task[16] = out_offset
-                            task[17] = nroots
-                            task[18:18 + nroots] = rt[:nroots].astype(np.float32)
-                            task[24:24 + nroots] = wt[:nroots].astype(np.float32)
-                            task[30:33] = PC.astype(np.float32)
-                            tasks_list.append(task)
-                            out_offset += n_out_triple
-
-                task_count = len(tasks_list) - task_start
-                if task_count > 0:
-                    meta.append((ish, jsh, ksh_idx, task_start, task_count,
-                                 nfi, nfj, nfk, n_out_triple))
-
-    if not tasks_list:
+    if not valid:
         return (np.zeros((0, TASK_STRIDE), dtype=np.float32),
-                np.zeros(0, dtype=np.int32), meta, 0)
-    tasks_arr = np.array(tasks_list, dtype=np.float32)
-    # Build int32 offset array from cumulative sizes (float32 task_data[16]
-    # can't represent offsets > 16M exactly due to precision limits).
-    n = len(tasks_list)
-    offsets = np.zeros(n, dtype=np.int32)
-    off = 0
-    for i in range(n):
-        offsets[i] = off
-        li = int(tasks_arr[i, 13]); lj = int(tasks_arr[i, 14])
-        lk = int(tasks_arr[i, 15])
-        off += 3 * int(_NCART_LUT[li]) * int(_NCART_LUT[lj]) * int(_NCART_LUT[lk])
-    return tasks_arr, offsets, meta, off
+                np.zeros(0, dtype=np.int32), [], 0)
+
+    # Phase 2: group by (n_ij, n_k) for batched expansion
+    groups = {}
+    for v in valid:
+        groups.setdefault((v[7], v[8]), []).append(v)
+
+    all_blocks = []
+    all_t_vals = []
+    all_nroots_flat = []
+    all_triple_idx = []
+    triple_info = []  # (ish, jsh, ksh, nfi, nfj, nfk, n_out)
+    eri_offset = 0
+
+    for (n_ij, n_k), glist in groups.items():
+        n_t = len(glist)
+        n_prim = n_ij * n_k
+
+        # Stack bra pair data: (n_t, n_ij[, 3])
+        aij_b = np.array([pair_cache[(g[0], g[1])][0] for g in glist])  # (n_t, n_ij)
+        ai_b = np.array([pair_cache[(g[0], g[1])][1] for g in glist])
+        PA_b = np.array([pair_cache[(g[0], g[1])][2] for g in glist])   # (n_t, n_ij, 3)
+        P_b = np.array([pair_cache[(g[0], g[1])][3] for g in glist])
+        cK_b = np.array([pair_cache[(g[0], g[1])][4] for g in glist])   # (n_t, n_ij)
+        AB_b = np.array([pair_cache[(g[0], g[1])][5] for g in glist])   # (n_t, 3)
+
+        # Aux data: (n_t, n_k[, 3])
+        ak_b = np.array([aux_exps[g[2]] for g in glist])               # (n_t, n_k)
+        ck_b = np.array([aux_coeffs[g[2]] for g in glist])
+        Rk_b = np.array([aux_R[g[2]] for g in glist])                   # (n_t, 3)
+
+        # Cross-product expansion: (n_t, n_prim=n_ij*n_k[, 3])
+        aij_f = np.repeat(aij_b, n_k, axis=1)                          # (n_t, n_prim)
+        ai_f = np.repeat(ai_b, n_k, axis=1)
+        ak_f = np.tile(ak_b, (1, n_ij))
+        PA_f = np.repeat(PA_b, n_k, axis=1)                            # (n_t, n_prim, 3)
+        P_f = np.repeat(P_b, n_k, axis=1)
+        coeff_f = np.repeat(cK_b, n_k, axis=1) * np.tile(ck_b, (1, n_ij))
+        Rk_f = np.tile(Rk_b[:, None, :], (1, n_prim, 1))              # broadcast
+        # Simpler: Rk is per-triple, same for all prims
+        PC_f = P_f - Rk_f                                              # (n_t, n_prim, 3)
+
+        aijk_f = aij_f + ak_f
+        prefac_f = coeff_f * 2.0 * PI_5_2 / (aij_f * ak_f * np.sqrt(aijk_f))
+
+        # Screening: mask out negligible primitives
+        screen = np.abs(prefac_f) > 1e-15
+
+        # T values: (n_t, n_prim)
+        theta_f = aij_f * ak_f / aijk_f
+        t_vals_f = theta_f * np.sum(PC_f ** 2, axis=2)
+
+        # Per-triple metadata
+        li_a = np.array([g[3] for g in glist], dtype=np.float32)
+        lj_a = np.array([g[4] for g in glist], dtype=np.float32)
+        lk_a = np.array([g[5] for g in glist], dtype=np.float32)
+        nr_a = np.array([g[6] for g in glist], dtype=np.float32)
+        ncarts = np.array([3 * int(_NCART_LUT[g[3]]) * int(_NCART_LUT[g[4]])
+                           * int(_NCART_LUT[g[5]]) for g in glist], dtype=np.int64)
+
+        # Output offsets: each primitive gets its own region
+        eri_sizes = ncarts * n_prim
+        eri_bases = np.empty(n_t, dtype=np.int64)
+        eri_bases[0] = eri_offset
+        if n_t > 1:
+            np.cumsum(eri_sizes[:-1], out=eri_bases[1:])
+            eri_bases[1:] += eri_offset
+        prim_idx = np.arange(n_prim)
+        eri_off_f = eri_bases[:, None] + prim_idx[None, :] * ncarts[:, None]
+        eri_offset += int(eri_sizes.sum())
+
+        # Build task block: (n_t * n_prim, TASK_STRIDE)
+        total = n_t * n_prim
+        block = np.zeros((total, TASK_STRIDE), dtype=np.float32)
+        block[:, 0] = aij_f.ravel()
+        block[:, 1] = ak_f.ravel()
+        block[:, 2:5] = PA_f.reshape(total, 3)
+        block[:, 5:8] = PC_f.reshape(total, 3)
+        block[:, 8:11] = np.repeat(AB_b, n_prim, axis=0)
+        block[:, 11] = prefac_f.ravel()
+        block[:, 12] = ai_f.ravel()
+        block[:, 13] = np.repeat(li_a, n_prim)
+        block[:, 14] = np.repeat(lj_a, n_prim)
+        block[:, 15] = np.repeat(lk_a, n_prim)
+        # slot 16 unused (offset in separate array)
+        block[:, 17] = np.repeat(nr_a, n_prim)
+        block[:, 30:33] = PC_f.reshape(total, 3)
+
+        # Apply screening
+        keep = screen.ravel()
+        block = block[keep]
+        eri_off_kept = eri_off_f.ravel()[keep]
+
+        all_blocks.append(block)
+        all_t_vals.append(t_vals_f.ravel()[keep])
+        all_nroots_flat.append(np.repeat(nr_a.astype(np.int32), n_prim)[keep])
+
+        # Triple info and task-to-triple mapping
+        t_start = len(triple_info)
+        for g in glist:
+            nfi = int(_NCART_LUT[g[3]])
+            nfj = int(_NCART_LUT[g[4]])
+            nfk = int(_NCART_LUT[g[5]])
+            triple_info.append((g[0], g[1], g[2], nfi, nfj, nfk, 3 * nfi * nfj * nfk))
+        all_triple_idx.append(np.repeat(
+            np.arange(t_start, t_start + n_t, dtype=np.int32), n_prim)[keep])
+
+    if not all_blocks:
+        return (np.zeros((0, TASK_STRIDE), dtype=np.float32),
+                np.zeros(0, dtype=np.int32), [], 0)
+
+    tasks = np.concatenate(all_blocks, axis=0)
+    task_tidx = np.concatenate(all_triple_idx)
+    t_all = np.concatenate(all_t_vals)
+    nroots_flat = np.concatenate(all_nroots_flat)
+    n_tasks = len(tasks)
+
+    # Phase 3: batched Boys + Rys (one call per nroots value)
+    for nr in range(1, 7):
+        nr_mask = nroots_flat == nr
+        if not np.any(nr_mask):
+            continue
+        m_max = 2 * nr - 1
+        fm = _boys_function_vec(m_max, t_all[nr_mask])
+        n_pts = fm.shape[1]
+        if nr <= 3:
+            # Use vectorized batch solver (fast)
+            roots_3, weights_3 = _rys_from_boys_batch(nr, fm)
+            roots = np.zeros((n_pts, 6), dtype=np.float64)
+            weights = np.zeros((n_pts, 6), dtype=np.float64)
+            roots[:, :3] = roots_3
+            weights[:, :3] = weights_3
+        else:
+            # Batch solver for nroots 4-6: Hankel matrix + companion eigenvalue
+            roots = np.zeros((n_pts, 6), dtype=np.float64)
+            weights = np.zeros((n_pts, 6), dtype=np.float64)
+            # Build Hankel matrices: H[i,j] = fm[i+j] for i,j in 0..nr-1
+            H = np.zeros((n_pts, nr, nr), dtype=np.float64)
+            rhs = np.zeros((n_pts, nr), dtype=np.float64)
+            for i in range(nr):
+                for j in range(nr):
+                    H[:, i, j] = fm[i + j]
+                rhs[:, i] = fm[nr + i]
+            # Solve H @ c = rhs (batch)
+            try:
+                c = np.linalg.solve(H, rhs)
+            except np.linalg.LinAlgError:
+                # Fallback to per-point for singular cases
+                for i in range(n_pts):
+                    rt, wt = _rys_from_boys(nr, fm[:, i])
+                    roots[i, :nr] = rt[:nr]
+                    weights[i, :nr] = wt[:nr]
+                tasks[nr_mask, 18:24] = roots.astype(np.float32)
+                tasks[nr_mask, 24:30] = weights.astype(np.float32)
+                continue
+            # Build companion matrix and find eigenvalues (roots)
+            comp = np.zeros((n_pts, nr, nr), dtype=np.float64)
+            for i in range(nr - 1):
+                comp[:, i + 1, i] = 1.0
+            for i in range(nr):
+                comp[:, i, nr - 1] = c[:, i]
+            batch_roots = np.real(np.linalg.eigvals(comp))
+            batch_roots.sort(axis=1)
+            roots[:, :nr] = batch_roots
+            # Weights from Vandermonde: V @ w = fm[0..nr-1]
+            V = np.zeros((n_pts, nr, nr), dtype=np.float64)
+            V[:, :, 0] = 1.0
+            for j in range(1, nr):
+                V[:, :, j] = batch_roots ** j
+            try:
+                batch_w = np.linalg.solve(V.transpose(0, 2, 1), fm[:nr].T)
+                weights[:, :nr] = batch_w
+            except np.linalg.LinAlgError:
+                for i in range(n_pts):
+                    rt, wt = _rys_from_boys(nr, fm[:, i])
+                    weights[i, :nr] = wt[:nr]
+        tasks[nr_mask, 18:24] = roots.astype(np.float32)
+        tasks[nr_mask, 24:30] = weights.astype(np.float32)
+
+    # Build int32 offset array via vectorized cumsum
+    n_out_per = np.array([triple_info[tidx][6] for tidx in task_tidx], dtype=np.int64)
+    offsets_i64 = np.zeros(n_tasks, dtype=np.int64)
+    if n_tasks > 1:
+        np.cumsum(n_out_per[:-1], out=offsets_i64[1:])
+    offsets = offsets_i64.astype(np.int32)
+    off = int(n_out_per.sum())
+
+    # Build meta for Phase C accumulation
+    # Group tasks by triple_info index
+    meta = []
+    if n_tasks > 0:
+        # Find contiguous runs of the same triple idx
+        changes = np.where(np.diff(task_tidx) != 0)[0] + 1
+        starts = np.concatenate([[0], changes])
+        ends = np.concatenate([changes, [n_tasks]])
+        for s, e in zip(starts, ends):
+            tidx = task_tidx[s]
+            ish, jsh, ksh, nfi, nfj, nfk, n_out = triple_info[tidx]
+            meta.append((ish, jsh, ksh, s, e - s, nfi, nfj, nfk, n_out))
+
+    return tasks, offsets, meta, off
 
 
 # ---------------------------------------------------------------------------
@@ -521,10 +687,10 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
         j0 = ao_loc_c[jsh]
         k0 = aux_loc_c[ksh] - p0_aux
         comp_stride = nfi * nfj * nfk
-        shell_block = np.zeros(n_out, dtype=np.float64)
-        for t in range(t_count):
-            t_off = int(offsets[t_start + t])
-            shell_block += int_buf[t_off:t_off + n_out]
+        # All t_count primitives are contiguous in int_buf
+        off_start = int(offsets[t_start])
+        shell_block = int_buf[off_start:off_start + t_count * n_out].reshape(
+            t_count, n_out).sum(axis=0)
         li = mol.bas_angular(ish)
         lj = mol.bas_angular(jsh)
         lk = auxmol.bas_angular(ksh)
