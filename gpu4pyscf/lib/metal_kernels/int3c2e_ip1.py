@@ -44,10 +44,11 @@ from pyscf.gto.moleintor import getints, make_cintopt
 _NCART_LUT = np.array([1, 3, 6, 10, 15], dtype=np.int32)
 PI_5_2 = pi ** 2.5  # 34.986...
 
-# Angular normalization factors matching eval_ao.py convention.
-# PySCF's gto_norm uses radial normalization (r^l exp(-ar^2) with r^2 dr),
-# which includes an extra sqrt(4pi/(2l+1)) compared to Cartesian normalization.
-# The fac_l factors undo this excess, matching the Rys J/K convention.
+# CINTcommon_fac_sp: per-shell normalization correction between
+# _libcint_ctr_coeff (radial gto_norm) and the standard integral formula.
+# For s-type (l=0): extra sqrt(4pi) in gto_norm, corrected by 1/sqrt(4pi).
+# For p-type (l=1): extra sqrt(4pi/3) in gto_norm, corrected by sqrt(3/(4pi)).
+# For l>=2: gto_norm matches the integral formula directly, no correction.
 _FAC_L = {0: sqrt(1.0 / (4 * pi)),
           1: sqrt(3.0 / (4 * pi)),
           2: 1.0, 3: 1.0, 4: 1.0}
@@ -353,8 +354,8 @@ def _build_3c_tasks(mol, auxmol, shl0_aux, shl1_aux):
                             a0 = aij * ak / aijk
                             PC = P - Rk
                             T = a0 * np.dot(PC, PC)
-                            fac = _FAC_L.get(li, 1.0) * _FAC_L.get(lj, 1.0) * _FAC_L.get(lk, 1.0)
-                            prefac = coeff_ij * ck * 2.0 * PI_5_2 / (aij * ak * sqrt(aijk)) * fac
+                            prefac = coeff_ij * ck * 2.0 * PI_5_2 / (aij * ak * sqrt(aijk))
+                            # Don't apply fac_l here; it's applied per-shell in Phase C
 
                             # Boys function (CPU f64)
                             fm = _boys_function_vec(2 * nroots - 1, np.array([T]))
@@ -371,18 +372,20 @@ def _build_3c_tasks(mol, auxmol, shl0_aux, shl1_aux):
                             task[13] = li
                             task[14] = lj
                             task[15] = lk
+                            # Each primitive gets its OWN output region
+                            # (no atomics, no race conditions)
                             task[16] = out_offset
                             task[17] = nroots
                             task[18:18 + nroots] = rt[:nroots].astype(np.float32)
                             task[24:24 + nroots] = wt[:nroots].astype(np.float32)
                             task[30:33] = PC.astype(np.float32)
                             tasks_list.append(task)
+                            out_offset += n_out_triple
 
                 task_count = len(tasks_list) - task_start
                 if task_count > 0:
                     meta.append((ish, jsh, ksh_idx, task_start, task_count,
                                  nfi, nfj, nfk, n_out_triple))
-                    out_offset += n_out_triple
 
     if not tasks_list:
         return np.zeros((0, TASK_STRIDE), dtype=np.float32), meta, 0
@@ -508,13 +511,16 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
         for t in range(t_count):
             t_off = int(tasks[t_start + t, 16])  # out_offset from task data
             shell_block += int_buf[t_off:t_off + n_out]
-        # Unpack into output tensor
+        # Unpack into output tensor with per-shell normalization
+        # fac_l = CINTcommon_fac_sp: 1/sqrt(4pi) for s, sqrt(3/(4pi)) for p, 1.0 for l>=2
+        li = mol.bas_angular(ish)
+        lj = mol.bas_angular(jsh)
+        lk = auxmol.bas_angular(ksh)
+        fac = _FAC_L[li] * _FAC_L[lj] * _FAC_L[lk]
         for comp in range(3):
-            for fi in range(nfi):
-                for fj in range(nfj):
-                    for fk in range(nfk):
-                        val = shell_block[comp * comp_stride + (fi * nfj + fj) * nfk + fk]
-                        out[comp, i0 + fi, j0 + fj, k0 + fk] += val
+            block = shell_block[comp*comp_stride:(comp+1)*comp_stride].reshape(nfi, nfj, nfk)
+            # Negate: int3c2e_ip1 = -d/dA (PySCF convention)
+            out[comp, i0:i0+nfi, j0:j0+nfj, k0:k0+nfk] -= block * fac
 
     return out
 
