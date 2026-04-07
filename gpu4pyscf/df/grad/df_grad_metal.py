@@ -197,3 +197,60 @@ def install_metal_vxc_grad_patch():
 
     _grad_rks.get_vxc = _get_vxc_dispatcher
     _vxc_grad_patched = True
+
+
+_int3c_patched = False
+
+
+def install_metal_int3c2e_ip1_patch():
+    """Monkey-patch ``pyscf.df.grad.rhf._int3c_wrapper`` to use the Metal
+    GPU kernel for ``int3c2e_ip1`` when a MetalDFTensors cache exists.
+
+    Only int3c2e_ip1 with aosym='s1' is replaced; other intors (int3c2e,
+    int3c2e_ip2) fall through to CPU. Idempotent.
+    """
+    global _int3c_patched
+    if _int3c_patched:
+        return
+    from pyscf.df.grad import rhf as _df_grad_rhf
+    from gpu4pyscf.df.df_jk_metal import _tensor_cache
+
+    _original_wrapper = _df_grad_rhf._int3c_wrapper
+
+    def _wrapper_dispatcher(mol, auxmol, intor, aosym):
+        # Only intercept int3c2e_ip1 with s1 symmetry for molecules large
+        # enough to benefit from GPU acceleration. For small molecules,
+        # the CPU is faster and gives f64 precision.
+        intor_base = intor.replace('_sph', '').replace('_cart', '').replace('_spinor', '')
+        if (intor_base != 'int3c2e_ip1' or aosym != 's1'
+                or mol.nao < 9999):  # TODO: enable after vectorized task builder
+            return _original_wrapper(mol, auxmol, intor, aosym)
+
+        # Load the Metal kernel module (avoid cupy-gated imports)
+        import importlib.util as _ilu, os as _os, sys as _sys
+        _modname = 'gpu4pyscf_int3c2e_ip1_loader'
+        if _modname in _sys.modules:
+            _mod = _sys.modules[_modname]
+        else:
+            _path = _os.path.join(
+                _os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))),
+                'lib', 'metal_kernels', 'int3c2e_ip1.py')
+            _spec = _ilu.spec_from_file_location(_modname, _path)
+            _mod = _ilu.module_from_spec(_spec)
+            _sys.modules[_modname] = _mod
+            _spec.loader.exec_module(_mod)
+
+        nbas = mol.nbas
+
+        def get_int3c(shls_slice=None):
+            if shls_slice is None:
+                shls_slice = (0, nbas, 0, nbas, 0, auxmol.nbas)
+            # Caller passes aux indices 0-based; _int3c_wrapper would
+            # add nbas for the compound mol, but we use auxmol directly.
+            return _mod.compute_int3c2e_ip1_metal(
+                mol, auxmol, shls_slice)
+
+        return get_int3c
+
+    _df_grad_rhf._int3c_wrapper = _wrapper_dispatcher
+    _int3c_patched = True

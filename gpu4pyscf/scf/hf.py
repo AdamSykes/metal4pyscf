@@ -370,12 +370,12 @@ def _patch_df_with_metal_jk(mf_df):
         _sys.modules[_grad_modname] = _grad_mod
         _grad_spec.loader.exec_module(_grad_mod)
     _grad_mod.install_metal_grad_patch()
-    # Phase 3: Metal XC nuclear-gradient kernel. Install the global
-    # get_vxc dispatcher, then flag this mf's numint so the dispatcher
-    # knows to route to Metal for this object specifically.
+    # Phase 3: Metal XC nuclear-gradient kernel.
     if hasattr(mf_df, '_numint'):
         _grad_mod.install_metal_vxc_grad_patch()
         mf_df._numint._metal_enabled = True
+    # Phase 4c: Metal int3c2e_ip1 kernel.
+    _grad_mod.install_metal_int3c2e_ip1_patch()
 
     # Relax convergence threshold to match f32 noise floor.
     # Metal J/K produce Fock matrices with ~1e-5 element-wise noise; at the

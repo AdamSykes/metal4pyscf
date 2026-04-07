@@ -126,7 +126,7 @@ float ai_exp  = task_data[off + 12];
 int li        = (int)task_data[off + 13];
 int lj        = (int)task_data[off + 14];
 int lk        = (int)task_data[off + 15];
-int out_off   = (int)task_data[off + 16];
+int out_off   = offsets[tid];
 int nroots    = (int)task_data[off + 17];
 float rys_r[6] = {task_data[off+18], task_data[off+19], task_data[off+20],
                    task_data[off+21], task_data[off+22], task_data[off+23]};
@@ -243,7 +243,7 @@ for (int iroot = 0; iroot < nroots; iroot++) {
 
 _int3c2e_ip1_kernel = mx.fast.metal_kernel(
     name='int3c2e_ip1_trr',
-    input_names=['task_data'],
+    input_names=['task_data', 'offsets'],
     output_names=['int_out'],
     header=_HEADER_3C,
     source=_SOURCE_3C,
@@ -388,8 +388,20 @@ def _build_3c_tasks(mol, auxmol, shl0_aux, shl1_aux):
                                  nfi, nfj, nfk, n_out_triple))
 
     if not tasks_list:
-        return np.zeros((0, TASK_STRIDE), dtype=np.float32), meta, 0
-    return np.array(tasks_list, dtype=np.float32), meta, out_offset
+        return (np.zeros((0, TASK_STRIDE), dtype=np.float32),
+                np.zeros(0, dtype=np.int32), meta, 0)
+    tasks_arr = np.array(tasks_list, dtype=np.float32)
+    # Build int32 offset array from cumulative sizes (float32 task_data[16]
+    # can't represent offsets > 16M exactly due to precision limits).
+    n = len(tasks_list)
+    offsets = np.zeros(n, dtype=np.int32)
+    off = 0
+    for i in range(n):
+        offsets[i] = off
+        li = int(tasks_arr[i, 13]); lj = int(tasks_arr[i, 14])
+        lk = int(tasks_arr[i, 15])
+        off += 3 * int(_NCART_LUT[li]) * int(_NCART_LUT[lj]) * int(_NCART_LUT[lk])
+    return tasks_arr, offsets, meta, off
 
 
 # ---------------------------------------------------------------------------
@@ -452,8 +464,9 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
         shls_slice: (i0, i1, j0, j1, k0_aux, k1_aux) in aux-shell indices
 
     Returns:
-        (3, nao_cart, nao_cart, naux_slice_cart) float64 array in Cartesian
-        basis, matching PySCF getints('int3c2e_ip1', aosym='s1').
+        float64 array matching PySCF getints('int3c2e_ip1', aosym='s1').
+        Shape depends on mol.cart: (3, nao, nao, naux_slice) in the
+        appropriate basis (Cartesian or spherical).
     """
     nbas = mol.nbas
     if shls_slice is None:
@@ -471,19 +484,20 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
         return _cpu_fallback(mol, auxmol, shls_slice)
 
     # Phase A: build tasks on CPU
-    tasks, meta, total_out = _build_3c_tasks(mol, auxmol, shl0_aux, shl1_aux)
+    tasks, offsets, meta, total_out = _build_3c_tasks(mol, auxmol, shl0_aux, shl1_aux)
 
     if len(tasks) == 0 or total_out == 0:
         return _cpu_fallback(mol, auxmol, shls_slice)
 
     # Phase B: run Metal kernel
     task_gpu = mx.array(tasks.ravel())
+    off_gpu = mx.array(offsets)
     n_tasks = tasks.shape[0]
     THREADS = 256
     grid_size = ((n_tasks + THREADS - 1) // THREADS) * THREADS
 
     result = _int3c2e_ip1_kernel(
-        inputs=[task_gpu],
+        inputs=[task_gpu, off_gpu],
         grid=(grid_size, 1, 1),
         threadgroup=(min(THREADS, n_tasks), 1, 1),
         output_shapes=[(total_out,)],
@@ -493,36 +507,97 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
     mx.eval(result[0])
     int_buf = np.array(result[0]).astype(np.float64)
 
-    # Phase C: accumulate into output tensor
+    # Phase C: accumulate into output tensor (Cartesian first, then cart2sph)
     nao_cart = mol.nao_cart()
-    aux_loc = auxmol.ao_loc_nr(cart=True)
-    naux_slice = aux_loc[shl1_aux] - aux_loc[shl0_aux]
-    p0_aux = aux_loc[shl0_aux]
-    ao_loc = mol.ao_loc_nr(cart=True)
+    naux_cart = auxmol.nao_cart()
+    aux_loc_c = auxmol.ao_loc_nr(cart=True)
+    naux_slice_c = aux_loc_c[shl1_aux] - aux_loc_c[shl0_aux]
+    p0_aux = aux_loc_c[shl0_aux]
+    ao_loc_c = mol.ao_loc_nr(cart=True)
 
-    out = np.zeros((3, nao_cart, nao_cart, naux_slice), dtype=np.float64)
+    out_cart = np.zeros((3, nao_cart, nao_cart, naux_slice_c), dtype=np.float64)
     for ish, jsh, ksh, t_start, t_count, nfi, nfj, nfk, n_out in meta:
-        i0 = ao_loc[ish]
-        j0 = ao_loc[jsh]
-        k0 = aux_loc[ksh] - p0_aux
+        i0 = ao_loc_c[ish]
+        j0 = ao_loc_c[jsh]
+        k0 = aux_loc_c[ksh] - p0_aux
         comp_stride = nfi * nfj * nfk
-        # Sum all primitives for this shell triple
         shell_block = np.zeros(n_out, dtype=np.float64)
         for t in range(t_count):
-            t_off = int(tasks[t_start + t, 16])  # out_offset from task data
+            t_off = int(offsets[t_start + t])
             shell_block += int_buf[t_off:t_off + n_out]
-        # Unpack into output tensor with per-shell normalization
-        # fac_l = CINTcommon_fac_sp: 1/sqrt(4pi) for s, sqrt(3/(4pi)) for p, 1.0 for l>=2
         li = mol.bas_angular(ish)
         lj = mol.bas_angular(jsh)
         lk = auxmol.bas_angular(ksh)
         fac = _FAC_L[li] * _FAC_L[lj] * _FAC_L[lk]
         for comp in range(3):
             block = shell_block[comp*comp_stride:(comp+1)*comp_stride].reshape(nfi, nfj, nfk)
-            # Negate: int3c2e_ip1 = -d/dA (PySCF convention)
-            out[comp, i0:i0+nfi, j0:j0+nfj, k0:k0+nfk] -= block * fac
+            out_cart[comp, i0:i0+nfi, j0:j0+nfj, k0:k0+nfk] -= block * fac
 
-    return out
+    if mol.cart:
+        # PySCF getints returns (ncomp, ni, nj, nk) with Fortran-ordered
+        # inner axes: strides=(big, 8, ni*8, ni*nj*8). Replicate this
+        # layout so that fdrv's ctypes access sees the correct strides
+        # after .transpose(0,3,2,1) in get_jk.
+        result = np.zeros((nao_cart, nao_cart, naux_slice_c, 3),
+                          dtype=np.float64, order='F').transpose(3, 0, 1, 2)
+        result[:] = out_cart
+        return result
+
+    # Cart-to-spherical transform for orbital indices (i, j) and aux (k)
+    from pyscf.gto.mole import cart2sph as _c2s
+
+    def _c2s_mat(l):
+        return np.asarray(_c2s(l, normalized='sp')).T  # (nsph, ncart)
+
+    nao = mol.nao
+    naux_slice = auxmol.ao_loc_nr()[shl1_aux] - auxmol.ao_loc_nr()[shl0_aux]
+    out = np.zeros((3, nao, nao, naux_slice), dtype=np.float64)
+
+    ao_loc_s = mol.ao_loc_nr()
+    aux_loc_s = auxmol.ao_loc_nr()
+    p0_aux_s = aux_loc_s[shl0_aux]
+
+    for comp in range(3):
+        # Transform i (first orbital index)
+        tmp1 = np.zeros((nao, nao_cart, naux_slice_c), dtype=np.float64)
+        for ish in range(mol.nbas):
+            l = mol.bas_angular(ish)
+            c0 = ao_loc_c[ish]; c1 = ao_loc_c[ish + 1]
+            s0 = ao_loc_s[ish]; s1 = ao_loc_s[ish + 1]
+            if l <= 1:
+                tmp1[s0:s1] = out_cart[comp, c0:c1]
+            else:
+                C = _c2s_mat(l)
+                tmp1[s0:s1] = np.einsum('si,ijk->sjk', C, out_cart[comp, c0:c1])
+
+        # Transform j (second orbital index)
+        tmp2 = np.zeros((nao, nao, naux_slice_c), dtype=np.float64)
+        for jsh in range(mol.nbas):
+            l = mol.bas_angular(jsh)
+            c0 = ao_loc_c[jsh]; c1 = ao_loc_c[jsh + 1]
+            s0 = ao_loc_s[jsh]; s1 = ao_loc_s[jsh + 1]
+            if l <= 1:
+                tmp2[:, s0:s1] = tmp1[:, c0:c1]
+            else:
+                C = _c2s_mat(l)
+                tmp2[:, s0:s1] = np.einsum('sj,ijk->isk', C, tmp1[:, c0:c1])
+
+        # Transform k (aux index)
+        for ksh in range(shl0_aux, shl1_aux):
+            l = auxmol.bas_angular(ksh)
+            c0 = aux_loc_c[ksh] - p0_aux; c1 = aux_loc_c[ksh + 1] - p0_aux
+            s0 = aux_loc_s[ksh] - p0_aux_s; s1 = aux_loc_s[ksh + 1] - p0_aux_s
+            if l <= 1:
+                out[comp, :, :, s0:s1] = tmp2[:, :, c0:c1]
+            else:
+                C = _c2s_mat(l)
+                out[comp, :, :, s0:s1] = np.einsum('sk,ijk->ijs', C, tmp2[:, :, c0:c1])
+
+    # Match getints' stride layout: (ni, nj, nk, ncomp) F-order → transpose
+    result = np.zeros((nao, nao, naux_slice, 3),
+                      dtype=np.float64, order='F').transpose(3, 0, 1, 2)
+    result[:] = out
+    return result
 
 
 def _cpu_fallback(mol, auxmol, shls_slice):
