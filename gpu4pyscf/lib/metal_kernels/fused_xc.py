@@ -657,15 +657,14 @@ def _batched_vxc_grad(mol, coords, dm, weights, ni, xc_code, xctype,
     Returns:
         (None, -vmat) where vmat is (3, nao, nao) f64.
     """
-    if xctype not in ('LDA', 'GGA'):
+    if xctype not in ('LDA', 'GGA', 'MGGA'):
         raise NotImplementedError(
-            f'_batched_vxc_grad: xctype={xctype} not supported '
-            '(Phase 3 covers LDA/GGA)')
+            f'_batched_vxc_grad: xctype={xctype} not supported')
 
     nao = mol.nao
     ngrids = coords.shape[0]
     dm_gpu = mx.array(np.asarray(dm, dtype=np.float32))
-    ao_deriv = 2 if xctype == 'GGA' else 1
+    ao_deriv = 2 if xctype in ('GGA', 'MGGA') else 1
 
     gridx_all = mx.array(coords[:, 0].astype(np.float32))
     gridy_all = mx.array(coords[:, 1].astype(np.float32))
@@ -692,7 +691,7 @@ def _batched_vxc_grad(mol, coords, dm, weights, ni, xc_code, xctype,
             rho_gpu = mx.sum(ao_val * tmp, axis=0)
             mx.eval(rho_gpu)
             rho = np.array(rho_gpu, dtype=np.float64)
-        else:  # GGA
+        elif xctype == 'GGA':
             rho0 = mx.sum(ao_val * tmp, axis=0)
             rho1 = 2.0 * mx.sum(ao_gpu[1] * tmp, axis=0)
             rho2 = 2.0 * mx.sum(ao_gpu[2] * tmp, axis=0)
@@ -701,58 +700,84 @@ def _batched_vxc_grad(mol, coords, dm, weights, ni, xc_code, xctype,
             rho = np.empty((4, ng), dtype=np.float64)
             rho[0] = np.array(rho0); rho[1] = np.array(rho1)
             rho[2] = np.array(rho2); rho[3] = np.array(rho3)
+        else:  # MGGA: rho has 6 components (rho, nabla_xyz, laplacian, tau)
+            rho0 = mx.sum(ao_val * tmp, axis=0)
+            rho1 = 2.0 * mx.sum(ao_gpu[1] * tmp, axis=0)
+            rho2 = 2.0 * mx.sum(ao_gpu[2] * tmp, axis=0)
+            rho3 = 2.0 * mx.sum(ao_gpu[3] * tmp, axis=0)
+            # laplacian = 2 * sum_d (ao[d+3] * tmp + ao[d] * (dm @ ao[d]))
+            # Simplified: lap = 2*(ao[4]+ao[7]+ao[9]) . tmp + 2*sum_d ao[d].(dm@ao[d])
+            tmp1 = dm_gpu @ ao_gpu[1]; tmp2 = dm_gpu @ ao_gpu[2]; tmp3 = dm_gpu @ ao_gpu[3]
+            rho4 = 2.0 * mx.sum((ao_gpu[4] + ao_gpu[7] + ao_gpu[9]) * tmp, axis=0)
+            rho4 = rho4 + 2.0 * (mx.sum(ao_gpu[1] * tmp1, axis=0)
+                                  + mx.sum(ao_gpu[2] * tmp2, axis=0)
+                                  + mx.sum(ao_gpu[3] * tmp3, axis=0))
+            # tau = 0.5 * sum_d sum_mu_nu D_mn ao[d,m] ao[d,n]
+            rho5 = 0.5 * (mx.sum(ao_gpu[1] * tmp1, axis=0)
+                          + mx.sum(ao_gpu[2] * tmp2, axis=0)
+                          + mx.sum(ao_gpu[3] * tmp3, axis=0))
+            mx.eval(rho0, rho1, rho2, rho3, rho4, rho5)
+            rho = np.empty((6, ng), dtype=np.float64)
+            rho[0] = np.array(rho0); rho[1] = np.array(rho1)
+            rho[2] = np.array(rho2); rho[3] = np.array(rho3)
+            rho[4] = np.array(rho4); rho[5] = np.array(rho5)
 
         vxc = ni.eval_xc_eff(xc_code, rho, deriv=1, xctype=xctype, spin=0)[1]
-        wv = wt * vxc                       # LDA: (1, ng); GGA: (4, ng)
+        wv = wt * vxc
 
         if xctype == 'LDA':
-            # vmat[x, mu, nu] += sum_p v_rho[p] . ao[1+x, mu, p] . ao[0, nu, p]
             wv0 = mx.array(wv[0].astype(np.float32))
-            aow = ao_val * wv0[None, :]     # (nao, ng)
+            aow = ao_val * wv0[None, :]
             vm0 = ao_gpu[1] @ mx.transpose(aow)
             vm1 = ao_gpu[2] @ mx.transpose(aow)
             vm2 = ao_gpu[3] @ mx.transpose(aow)
         else:
-            # GGA: wv[0] *= 0.5 halves v_rho to avoid double-counting,
-            # because v_rho appears in both Part 1 (k=0) and Part 2 (d=0).
+            # GGA / MGGA: wv[0] *= 0.5 to de-double-count v_rho
             wv = wv.copy()
             wv[0] *= 0.5
+            if xctype == 'MGGA' and len(wv) > 4:
+                wv[4] *= 0.5  # tau factor 1/2
             w0 = mx.array(wv[0].astype(np.float32))
             w1 = mx.array(wv[1].astype(np.float32))
             w2 = mx.array(wv[2].astype(np.float32))
             w3 = mx.array(wv[3].astype(np.float32))
 
-            # Part 1: aow_1[mu, p] = sum_k wv[k, p] . ao[k, mu, p]  (k=0..3)
-            aow_1 = (ao_gpu[0] * w0[None, :]
-                     + ao_gpu[1] * w1[None, :]
-                     + ao_gpu[2] * w2[None, :]
-                     + ao_gpu[3] * w3[None, :])
-            # vmat[x, mu, nu] += sum_p ao[1+x, mu, p] . aow_1[nu, p]
+            # GGA Part 1: aow_1 = sum_k wv[k]*ao[k] (k=0..3)
+            aow_1 = (ao_gpu[0]*w0[None,:] + ao_gpu[1]*w1[None,:]
+                     + ao_gpu[2]*w2[None,:] + ao_gpu[3]*w3[None,:])
             vm0 = ao_gpu[1] @ mx.transpose(aow_1)
             vm1 = ao_gpu[2] @ mx.transpose(aow_1)
             vm2 = ao_gpu[3] @ mx.transpose(aow_1)
 
-            # Part 2: aow_A[mu, p] = v_rho . ao[1+A, mu, p]
-            #                      + sum_B v_sigma_B . ao[mixed(A,B), mu, p]
-            # Index map for deriv=2: val=0, dx=1, dy=2, dz=3,
-            #   dxx=4, dxy=5, dxz=6, dyy=7, dyz=8, dzz=9
-            # (XX,XY,XZ)=(4,5,6); (YX,YY,YZ)=(5,7,8); (ZX,ZY,ZZ)=(6,8,9)
-            aow_X = (ao_gpu[1] * w0[None, :]
-                     + ao_gpu[4] * w1[None, :]
-                     + ao_gpu[5] * w2[None, :]
-                     + ao_gpu[6] * w3[None, :])
-            aow_Y = (ao_gpu[2] * w0[None, :]
-                     + ao_gpu[5] * w1[None, :]
-                     + ao_gpu[7] * w2[None, :]
-                     + ao_gpu[8] * w3[None, :])
-            aow_Z = (ao_gpu[3] * w0[None, :]
-                     + ao_gpu[6] * w1[None, :]
-                     + ao_gpu[8] * w2[None, :]
-                     + ao_gpu[9] * w3[None, :])
-            # vmat[x, mu, nu] += sum_p aow_A[mu, p] . ao[0, nu, p]
+            # GGA Part 2: mixed second derivatives
+            aow_X = (ao_gpu[1]*w0[None,:] + ao_gpu[4]*w1[None,:]
+                     + ao_gpu[5]*w2[None,:] + ao_gpu[6]*w3[None,:])
+            aow_Y = (ao_gpu[2]*w0[None,:] + ao_gpu[5]*w1[None,:]
+                     + ao_gpu[7]*w2[None,:] + ao_gpu[8]*w3[None,:])
+            aow_Z = (ao_gpu[3]*w0[None,:] + ao_gpu[6]*w1[None,:]
+                     + ao_gpu[8]*w2[None,:] + ao_gpu[9]*w3[None,:])
             vm0 = vm0 + aow_X @ mx.transpose(ao_val)
             vm1 = vm1 + aow_Y @ mx.transpose(ao_val)
             vm2 = vm2 + aow_Z @ mx.transpose(ao_val)
+
+            # MGGA tau term: _tau_grad_dot_
+            if xctype == 'MGGA' and len(wv) > 4:
+                w4 = mx.array(wv[4].astype(np.float32))
+                # dx contribution
+                aow_t = ao_gpu[1] * w4[None, :]
+                vm0 = vm0 + ao_gpu[4] @ mx.transpose(aow_t)  # dxx . dx
+                vm1 = vm1 + ao_gpu[5] @ mx.transpose(aow_t)  # dxy . dx
+                vm2 = vm2 + ao_gpu[6] @ mx.transpose(aow_t)  # dxz . dx
+                # dy contribution
+                aow_t = ao_gpu[2] * w4[None, :]
+                vm0 = vm0 + ao_gpu[5] @ mx.transpose(aow_t)  # dxy . dy
+                vm1 = vm1 + ao_gpu[7] @ mx.transpose(aow_t)  # dyy . dy
+                vm2 = vm2 + ao_gpu[8] @ mx.transpose(aow_t)  # dyz . dy
+                # dz contribution
+                aow_t = ao_gpu[3] * w4[None, :]
+                vm0 = vm0 + ao_gpu[6] @ mx.transpose(aow_t)  # dxz . dz
+                vm1 = vm1 + ao_gpu[8] @ mx.transpose(aow_t)  # dyz . dz
+                vm2 = vm2 + ao_gpu[9] @ mx.transpose(aow_t)  # dzz . dz
 
         vmat_gpu = vmat_gpu + mx.stack([vm0, vm1, vm2], axis=0)
         mx.eval(vmat_gpu)
@@ -774,7 +799,7 @@ def _batched_vxc_grad_uks(mol, coords, dm_a, dm_b, weights, ni, xc_code,
     Returns:
         (None, -vmat) where vmat is (2, 3, nao, nao) f64.
     """
-    if xctype not in ('LDA', 'GGA'):
+    if xctype not in ('LDA', 'GGA', 'MGGA'):
         raise NotImplementedError(
             f'_batched_vxc_grad_uks: xctype={xctype} not supported')
 
@@ -782,7 +807,7 @@ def _batched_vxc_grad_uks(mol, coords, dm_a, dm_b, weights, ni, xc_code,
     ngrids = coords.shape[0]
     dm_a_gpu = mx.array(np.asarray(dm_a, dtype=np.float32))
     dm_b_gpu = mx.array(np.asarray(dm_b, dtype=np.float32))
-    ao_deriv = 2 if xctype == 'GGA' else 1
+    ao_deriv = 2 if xctype in ('GGA', 'MGGA') else 1
 
     gridx_all = mx.array(coords[:, 0].astype(np.float32))
     gridy_all = mx.array(coords[:, 1].astype(np.float32))
@@ -811,7 +836,7 @@ def _batched_vxc_grad_uks(mol, coords, dm_a, dm_b, weights, ni, xc_code,
             mx.eval(rho_a_gpu, rho_b_gpu)
             rho_a = np.array(rho_a_gpu, dtype=np.float64)
             rho_b = np.array(rho_b_gpu, dtype=np.float64)
-        else:
+        elif xctype == 'GGA':
             r0a = mx.sum(ao_val * tmp_a, axis=0)
             r1a = 2.0 * mx.sum(ao_gpu[1] * tmp_a, axis=0)
             r2a = 2.0 * mx.sum(ao_gpu[2] * tmp_a, axis=0)
@@ -827,6 +852,25 @@ def _batched_vxc_grad_uks(mol, coords, dm_a, dm_b, weights, ni, xc_code,
             rho_a[2] = np.array(r2a); rho_a[3] = np.array(r3a)
             rho_b[0] = np.array(r0b); rho_b[1] = np.array(r1b)
             rho_b[2] = np.array(r2b); rho_b[3] = np.array(r3b)
+        else:  # MGGA
+            def _mgga_rho(tmp_s):
+                r0 = mx.sum(ao_val * tmp_s, axis=0)
+                r1 = 2.0 * mx.sum(ao_gpu[1] * tmp_s, axis=0)
+                r2 = 2.0 * mx.sum(ao_gpu[2] * tmp_s, axis=0)
+                r3 = 2.0 * mx.sum(ao_gpu[3] * tmp_s, axis=0)
+                t1 = dm_a_gpu @ ao_gpu[1] if tmp_s is tmp_a else dm_b_gpu @ ao_gpu[1]
+                t2 = dm_a_gpu @ ao_gpu[2] if tmp_s is tmp_a else dm_b_gpu @ ao_gpu[2]
+                t3 = dm_a_gpu @ ao_gpu[3] if tmp_s is tmp_a else dm_b_gpu @ ao_gpu[3]
+                r4 = 2.0*mx.sum((ao_gpu[4]+ao_gpu[7]+ao_gpu[9])*tmp_s, axis=0)
+                r4 = r4 + 2.0*(mx.sum(ao_gpu[1]*t1,axis=0)+mx.sum(ao_gpu[2]*t2,axis=0)+mx.sum(ao_gpu[3]*t3,axis=0))
+                r5 = 0.5*(mx.sum(ao_gpu[1]*t1,axis=0)+mx.sum(ao_gpu[2]*t2,axis=0)+mx.sum(ao_gpu[3]*t3,axis=0))
+                mx.eval(r0,r1,r2,r3,r4,r5)
+                rho = np.empty((6, ng), dtype=np.float64)
+                rho[0]=np.array(r0); rho[1]=np.array(r1); rho[2]=np.array(r2)
+                rho[3]=np.array(r3); rho[4]=np.array(r4); rho[5]=np.array(r5)
+                return rho
+            rho_a = _mgga_rho(tmp_a)
+            rho_b = _mgga_rho(tmp_b)
 
         # XC kernel with spin=1 → vxc shape (2, ncomp, ngrids)
         vxc = ni.eval_xc_eff(xc_code, (rho_a, rho_b), deriv=1,
@@ -846,6 +890,8 @@ def _batched_vxc_grad_uks(mol, coords, dm_a, dm_b, weights, ni, xc_code,
             else:
                 wv_s = wv_s.copy()
                 wv_s[0] *= 0.5
+                if xctype == 'MGGA' and len(wv_s) > 4:
+                    wv_s[4] *= 0.5
                 w0 = mx.array(wv_s[0].astype(np.float32))
                 w1 = mx.array(wv_s[1].astype(np.float32))
                 w2 = mx.array(wv_s[2].astype(np.float32))
@@ -864,6 +910,13 @@ def _batched_vxc_grad_uks(mol, coords, dm_a, dm_b, weights, ni, xc_code,
                 vm0 = vm0 + aow_X @ mx.transpose(ao_val)
                 vm1 = vm1 + aow_Y @ mx.transpose(ao_val)
                 vm2 = vm2 + aow_Z @ mx.transpose(ao_val)
+                if xctype == 'MGGA' and len(wv_s) > 4:
+                    w4 = mx.array(wv_s[4].astype(np.float32))
+                    for d, ao_d in [(1, [4,5,6]), (2, [5,7,8]), (3, [6,8,9])]:
+                        aow_t = ao_gpu[d] * w4[None, :]
+                        vm0 = vm0 + ao_gpu[ao_d[0]] @ mx.transpose(aow_t)
+                        vm1 = vm1 + ao_gpu[ao_d[1]] @ mx.transpose(aow_t)
+                        vm2 = vm2 + ao_gpu[ao_d[2]] @ mx.transpose(aow_t)
 
             vm_stack = mx.stack([vm0, vm1, vm2], axis=0)
             if s == 0:

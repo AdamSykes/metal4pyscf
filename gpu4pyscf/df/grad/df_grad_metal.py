@@ -170,7 +170,7 @@ def install_metal_vxc_grad_patch():
             return _original_get_vxc(ni, mol, grids, xc_code, dms,
                                      relativity, hermi, max_memory, verbose)
         xctype = ni._xc_type(xc_code)
-        if xctype not in ('LDA', 'GGA'):
+        if xctype not in ('LDA', 'GGA', 'MGGA'):
             return _original_get_vxc(ni, mol, grids, xc_code, dms,
                                      relativity, hermi, max_memory, verbose)
         dms_arr = np.asarray(dms)
@@ -209,7 +209,7 @@ def install_metal_vxc_grad_patch():
             return _original_get_vxc_uks(ni, mol, grids, xc_code, dms,
                                           relativity, hermi, max_memory, verbose)
         xctype = ni._xc_type(xc_code)
-        if xctype not in ('LDA', 'GGA'):
+        if xctype not in ('LDA', 'GGA', 'MGGA'):
             return _original_get_vxc_uks(ni, mol, grids, xc_code, dms,
                                           relativity, hermi, max_memory, verbose)
         return _get_vxc_dispatcher(ni, mol, grids, xc_code, dms,
