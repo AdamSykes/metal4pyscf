@@ -21,6 +21,43 @@ from pyscf.gto.moleintor import getints, make_cintopt
 _NCART_LUT = np.array([1, 3, 6, 10, 15], dtype=np.int32)
 PI_5_2 = pi ** 2.5
 
+
+# ---------------------------------------------------------------------------
+# Rys lookup tables (extracted from CUDA rys_roots_dat.cu)
+# ---------------------------------------------------------------------------
+
+def _load_rys_tables():
+    """Load Rys root/weight Chebyshev interpolation tables from CUDA data."""
+    import re, os
+    dat_path = os.path.join(os.path.dirname(__file__), '..', 'gvhf-rys', 'rys_roots_dat.cu')
+    with open(dat_path) as f:
+        text = f.read()
+
+    def _extract(name):
+        m = re.search(rf'{name}\[\]\s*=\s*\{{([^}}]+)\}}', text, re.DOTALL)
+        nums = re.findall(r'[-+]?\d+\.?\d*[eE][-+]?\d+', m.group(1))
+        return np.array([float(x) for x in nums], dtype=np.float32)
+
+    return {
+        'rw_table': _extract('ROOT_RW_DATA'),
+        'smallx_r0': _extract('ROOT_SMALLX_R0'),
+        'smallx_r1': _extract('ROOT_SMALLX_R1'),
+        'smallx_w0': _extract('ROOT_SMALLX_W0'),
+        'smallx_w1': _extract('ROOT_SMALLX_W1'),
+        'largex_r': _extract('ROOT_LARGEX_R_DATA'),
+        'largex_w': _extract('ROOT_LARGEX_W_DATA'),
+    }
+
+
+_rys_tables = None
+
+def _get_rys_tables():
+    global _rys_tables
+    if _rys_tables is None:
+        raw = _load_rys_tables()
+        _rys_tables = {k: mx.array(v) for k, v in raw.items()}
+    return _rys_tables
+
 _FAC_L = {0: sqrt(1.0 / (4 * pi)),
           1: sqrt(3.0 / (4 * pi)),
           2: 1.0, 3: 1.0, 4: 1.0}
@@ -143,65 +180,54 @@ if (T < 1e-7f) {
     }
 }
 
-// --- Inline Rys roots (nroots 1-2 direct, 3+ fallback to nroots=1 approx) ---
+// --- Rys roots/weights via Chebyshev lookup table (Clenshaw recurrence) ---
+// Table layout: per nroots n, offset = 560*n*(n-1), entries for 2n arrays
+// (n roots + n weights), each 14 coefficients × 40 intervals = 560 entries.
 float rys_r[6] = {0,0,0,0,0,0}, rys_w[6] = {0,0,0,0,0,0};
-if (nroots == 1) {
-    rys_r[0] = Fm[1] / max(Fm[0], 1e-30f);
-    rys_w[0] = Fm[0];
-} else if (nroots == 2) {
-    float det2 = Fm[0]*Fm[2] - Fm[1]*Fm[1];
-    if (abs(det2) > 1e-20f) {
-        float c0_ = (Fm[2]*Fm[2] - Fm[1]*Fm[3]) / det2;
-        float c1_ = (Fm[0]*Fm[3] - Fm[1]*Fm[2]) / det2;
-        float disc = max(c1_*c1_ + 4.0f*c0_, 0.0f);
-        float sq = sqrt(disc);
-        rys_r[0] = (c1_-sq)*0.5f; rys_r[1] = (c1_+sq)*0.5f;
-        float sep = max(abs(rys_r[1]-rys_r[0]), 1e-20f);
-        rys_w[1] = (Fm[1]-Fm[0]*rys_r[0]) / sep;
-        rys_w[0] = Fm[0] - rys_w[1];
-    } else {
-        float t_ = Fm[1] / max(Fm[0], 1e-30f);
-        rys_r[0] = rys_r[1] = t_;
-        rys_w[0] = rys_w[1] = Fm[0]*0.5f;
+float x_rys = T;  // Boys argument = Rys argument
+if (x_rys < 3.0e-7f) {
+    // Small x: linear approximation from SMALLX tables
+    for (int r = 0; r < nroots; r++) {
+        int sidx = nroots*(nroots-1)/2 + r;
+        rys_r[r] = smallx_r0[sidx] + smallx_r1[sidx] * x_rys;
+        rys_w[r] = smallx_w0[sidx] + smallx_w1[sidx] * x_rys;
+    }
+} else if (x_rys > 35.0f + 5.0f * float(nroots)) {
+    // Large x: asymptotic
+    float inv_x = 1.0f / x_rys;
+    float sqrt_inv_x = sqrt(inv_x);
+    for (int r = 0; r < nroots; r++) {
+        int sidx = nroots*(nroots-1)/2 + r;
+        rys_r[r] = largex_r[sidx] * inv_x;
+        rys_w[r] = largex_w[sidx] * sqrt_inv_x;
     }
 } else {
-    // nroots >= 3: Hankel 3x3 + trigonometric cubic.
-    // f32 precision is limited for some T ranges — errors in individual
-    // integrals may be large but tend to average out in gradient contractions.
-    float Ha=Fm[0],Hb=Fm[1],Hc=Fm[2],He=Fm[2],Hf=Fm[3],Hi=Fm[4];
-    float detH = Ha*(He*Hi-Hf*Hf) - Hb*(Hb*Hi-Hf*Hc) + Hc*(Hb*Hf-He*Hc);
-    if (abs(detH) > 1e-20f) {
-        float r0_=Fm[3],r1_=Fm[4],r2_=Fm[5];
-        float cc0=(r0_*(He*Hi-Hf*Hf)-Hb*(r1_*Hi-Hf*r2_)+Hc*(r1_*Hf-He*r2_))/detH;
-        float cc1=(Ha*(r1_*Hi-Hf*r2_)-r0_*(Hb*Hi-Hf*Hc)+Hc*(Hb*r2_-r1_*Hc))/detH;
-        float cc2=(Ha*(He*r2_-r1_*Hf)-Hb*(Hb*r2_-r1_*Hc)+r0_*(Hb*Hf-He*Hc))/detH;
-        float p_=-cc1-cc2*cc2/3.0f;
-        float q_=-2.0f*cc2*cc2*cc2/27.0f-cc2*cc1/3.0f-cc0;
-        float neg_p3=max(-p_/3.0f,1e-20f);
-        float sqnp3=sqrt(neg_p3);
-        float arg_=clamp(-q_/max(2.0f*sqnp3*sqnp3*sqnp3,1e-20f),-1.0f,1.0f);
-        float phi_=acos(arg_);
-        float m_=2.0f*sqnp3;
-        rys_r[0]=m_*cos(phi_/3.0f)+cc2/3.0f;
-        rys_r[1]=m_*cos((phi_-6.2831853f)/3.0f)+cc2/3.0f;
-        rys_r[2]=m_*cos((phi_+6.2831853f)/3.0f)+cc2/3.0f;
-        if(rys_r[0]>rys_r[1]){float t_=rys_r[0];rys_r[0]=rys_r[1];rys_r[1]=t_;}
-        if(rys_r[1]>rys_r[2]){float t_=rys_r[1];rys_r[1]=rys_r[2];rys_r[2]=t_;}
-        if(rys_r[0]>rys_r[1]){float t_=rys_r[0];rys_r[0]=rys_r[1];rys_r[1]=t_;}
-        // Vandermonde weights
-        float Va_=1,Vb_=rys_r[0],Vc_=Vb_*Vb_;
-        float Vd_=1,Ve_=rys_r[1],Vf_=Ve_*Ve_;
-        float Vg_=1,Vh_=rys_r[2],Vi_=Vh_*Vh_;
-        float vdet=Va_*(Ve_*Vi_-Vf_*Vh_)-Vb_*(Vd_*Vi_-Vf_*Vg_)+Vc_*(Vd_*Vh_-Ve_*Vg_);
-        if(abs(vdet)>1e-20f){
-            rys_w[0]=(Fm[0]*(Ve_*Vi_-Vf_*Vh_)-Vb_*(Fm[1]*Vi_-Vf_*Fm[2])+Vc_*(Fm[1]*Vh_-Ve_*Fm[2]))/vdet;
-            rys_w[1]=(Va_*(Fm[1]*Vi_-Vf_*Fm[2])-Fm[0]*(Vd_*Vi_-Vf_*Vg_)+Vc_*(Vd_*Fm[2]-Fm[1]*Vg_))/vdet;
-            rys_w[2]=(Va_*(Ve_*Fm[2]-Fm[1]*Vh_)-Vb_*(Vd_*Fm[2]-Fm[1]*Vg_)+Fm[0]*(Vd_*Vh_-Ve_*Vg_))/vdet;
-        } else { rys_w[0]=rys_w[1]=rys_w[2]=Fm[0]/3.0f; }
-        for(int r=3;r<nroots;r++){rys_r[r]=rys_r[2];rys_w[r]=0.0f;}
-    } else {
-        float t_=Fm[1]/max(Fm[0],1e-30f);
-        for(int r=0;r<nroots;r++){rys_r[r]=t_;rys_w[r]=Fm[0]/float(nroots);}
+    // Medium x: Chebyshev interpolation with Clenshaw recurrence
+    int it = min((int)(x_rys * 0.4f), 39);
+    float u = (x_rys - float(it) * 2.5f) * 0.8f - 1.0f;
+    float u2 = 2.0f * u;
+    int nroots_off = 560 * nroots * (nroots - 1);  // offset into rw_table for this nroots
+    for (int r = 0; r < nroots; r++) {
+        // Root coefficients: nroots_off + (2*r)*560
+        // Weight coefficients: nroots_off + (2*r+1)*560
+        for (int rw = 0; rw < 2; rw++) {  // 0=root, 1=weight
+            int base = nroots_off + (2*r + rw) * 560 + it;
+            // Clenshaw recurrence (degree=13, odd)
+            float c0 = rw_table[base + 13*40];
+            float c1 = rw_table[base + 12*40];
+            for (int n = 11; n >= 1; n -= 2) {
+                float c2 = rw_table[base + n*40] - c1;
+                float c3 = c0 + c1 * u2;
+                c1 = c2 + c3 * u2;
+                c0 = rw_table[base + (n-1)*40] - c3;
+            }
+            float val = c0 + c1 * u;
+            if (rw == 0) {
+                rys_r[r] = val;  // table stores t^2 directly
+            } else {
+                rys_w[r] = val;
+            }
+        }
     }
 }
 
@@ -283,7 +309,9 @@ _kernel_v2 = mx.fast.metal_kernel(
     name='int3c2e_ip1_v2',
     input_names=['triples', 'shell_x', 'shell_y', 'shell_z',
                  'shell_l', 'shell_nprim', 'prim_off',
-                 'exps', 'coeffs', 'out_offsets'],
+                 'exps', 'coeffs', 'out_offsets',
+                 'rw_table', 'smallx_r0', 'smallx_r1',
+                 'smallx_w0', 'smallx_w1', 'largex_r', 'largex_w'],
     output_names=['int_out'],
     header=_HEADER_V2,
     source=_SOURCE_V2,
@@ -401,10 +429,14 @@ def compute_int3c2e_ip1_v2(mol, auxmol, shls_slice=None):
     THREADS = 64  # lower than 256: each thread does more work (primitive loop)
     grid_size = ((n_triples + THREADS - 1) // THREADS) * THREADS
 
+    rys = _get_rys_tables()
     result = _kernel_v2(
         inputs=[mx.array(triples_arr.ravel()), mx.array(sx), mx.array(sy),
                 mx.array(sz), mx.array(sl), mx.array(snp), mx.array(spo),
-                mx.array(exps), mx.array(coeffs), mx.array(offsets)],
+                mx.array(exps), mx.array(coeffs), mx.array(offsets),
+                rys['rw_table'], rys['smallx_r0'], rys['smallx_r1'],
+                rys['smallx_w0'], rys['smallx_w1'],
+                rys['largex_r'], rys['largex_w']],
         grid=(grid_size, 1, 1),
         threadgroup=(min(THREADS, n_triples), 1, 1),
         output_shapes=[(total_out,)],
