@@ -12,9 +12,11 @@ Requires macOS on Apple Silicon (M1 or later), Python 3.10+.
 pip install -e .
 ```
 
-Dependencies (installed automatically): `pyscf`, `mlx`, `numpy`, `scipy`, `h5py`, `geometric`.
+Dependencies (installed automatically): `pyscf`, `mlx`, `numpy`, `scipy`, `numba`, `h5py`, `geometric`.
 
 ## Quick Start
+
+**Single-point energy:**
 
 ```python
 import pyscf
@@ -25,100 +27,107 @@ mol = pyscf.M(
     basis='def2-tzvpp')
 
 mf = RKS(mol, xc='B3LYP').density_fit()
-mf.kernel()
-print(f'Energy: {mf.e_tot:.10f} Ha')
+mf.kernel()  # Metal-accelerated SCF
 ```
 
-## Features
+**Geometry optimization:**
 
-All standard PySCF quantum chemistry methods are accessible:
+```python
+from pyscf.geomopt.geometric_solver import optimize
+
+mol_eq = optimize(mf)  # Metal-accelerated SCF + gradient per step
+```
+
+**Open-shell (UKS):**
+
+```python
+from gpu4pyscf.dft import UKS
+
+mol = pyscf.M(atom='O 0 0 0; H 0 0 0.97', spin=1, basis='def2-svp')
+mf = UKS(mol, xc='B3LYP').density_fit()
+mf.kernel()
+g = mf.nuc_grad_method().kernel()  # Metal-accelerated gradient
+```
+
+Metal acceleration activates automatically via `density_fit()`. No code changes needed compared to PySCF — just import from `gpu4pyscf` instead of `pyscf`.
+
+## Features
 
 | Feature | Metal GPU accelerated | CPU fallback |
 |---------|----------------------|-------------|
 | RHF / UHF | Energy (DF-J/K on GPU) | ROHF, GHF |
-| RKS (any XC functional) | Energy (DF-J/K + XC on GPU) | — |
-| UKS (any XC functional) | Energy (DF-J/K + XC on GPU, batched α/β) | ROKS, GKS |
+| RKS / UKS (any XC) | Energy (DF-J/K + XC on GPU) | ROKS, GKS |
 | Density fitting | J/K contractions (6-12x/cycle) | Integral precomputation |
-| Analytical gradients | — | Via PySCF (f64 refinement) |
-| Geometry optimization | — | Via geomeTRIC / berny |
+| Analytical gradients | XC gradient (4.4x), DF cho_solve (13x) | int3c2e_ip1 (CPU libcint) |
+| Geometry optimization | 1.8x per step (Metal SCF + gradient) | — |
 | Analytical Hessians | — | Via PySCF (f64 refinement) |
 | Frequency analysis | — | Via PySCF |
 | TDDFT / TDA | — | Via PySCF (f64 refinement) |
 | PCM / IEF-PCM / SS(V)PE | — | Via PySCF |
-| MP2 | — | Via PySCF |
-| CCSD | — | Via PySCF |
-| PBC (periodic) | — | Via PySCF |
-| QM/MM | — | Via PySCF |
+| MP2, CCSD, PBC, QM/MM | — | Via PySCF |
 
 ## Performance
 
-End-to-end DF-B3LYP SCF on Apple M4 Pro (48 GB), warm GPU, cached CDERI:
+Benchmarks on Apple M4 Pro (48 GB), warm GPU, cached CDERI.
 
-**RKS (closed-shell):**
+**DF-B3LYP SCF energy:**
 
 | System | AOs | PySCF CPU | Metal GPU | Speedup |
 |--------|-----|-----------|-----------|---------|
-| H₂O / def2-TZVP | 34 | 0.4s | 0.1s | **3.7x** |
-| CH₄ / def2-TZVPP | 84 | 1.1s | 0.4s | **2.8x** |
+| H2O / def2-TZVP | 34 | 0.4s | 0.1s | **3.7x** |
 | Benzene / def2-SVP | 114 | 2.9s | 0.9s | **3.2x** |
 | Benzene / def2-TZVP | 228 | 4.6s | 1.9s | **2.5x** |
-| Naphthalene / def2-TZVP | 358 | 12.4s | 4.5s | **2.8x** |
+| Caffeine / def2-SVP | 246 | 11.4s | 4.5s | **2.5x** |
 | Aspirin / def2-TZVP | 451 | 21.6s | 6.7s | **3.2x** |
-| Anthracene / def2-TZVP | 494 | 18.7s | 7.7s | **2.4x** |
-| Caffeine / def2-TZVPP | 557 | 40.3s | 22.2s | **1.8x** |
 
-**UKS (open-shell):**
+**DF-B3LYP single-point + gradient (caffeine/def2-SVP):**
 
-| System | PySCF CPU | Metal GPU | Speedup |
-|--------|-----------|-----------|---------|
-| NO₂ radical / def2-TZVP | 1.4s | 0.5s | **3.0x** |
-| Phenyl radical / def2-TZVPP | 9.3s | 2.3s | **4.0x** |
-| Phenyl radical / def2-TZVP | 10.7s | 1.6s | **6.5x** |
+| Component | CPU | Metal | Speedup |
+|-----------|-----|-------|---------|
+| SCF energy | 11.4s | 4.5s | **2.5x** |
+| XC gradient (`get_vxc`) | 0.82s | 0.21s | **4.4x** |
+| DF Cholesky solve | 0.51s | 0.03s | **13x** |
+| int3c2e_ip1 integrals | 3.1s | 3.1s | 1.0x (CPU) |
+| **Total gradient** | **9.0s** | **7.9s** | **1.14x** |
+| **Total SCF + gradient** | **20.4s** | **12.4s** | **1.65x** |
 
-Energies match PySCF CPU reference to ≤1e-5 Ha across all systems (well within chemical accuracy).
+**Geometry optimization per step (caffeine/def2-SVP):**
 
-**Per-component speedups:**
-- DF J/K contractions: **6-12x** per SCF cycle (batched over spins for UKS)
-- XC grid integration: **3.2x** (Metal `eval_ao` + fused rho/Vxc kernels)
-- DF tensor build: **4.4x** (GPU `unpack_tril`)
+| Component | CPU | Metal | Speedup |
+|-----------|-----|-------|---------|
+| SCF | ~11s | ~3.2s | **3.4x** |
+| Gradient | ~9s | ~7.7s | **1.17x** |
+| **Per step** | **~20s** | **~10.9s** | **1.84x** |
 
-**Analytical gradients and Hessians** give correct results (f64-refined, 1e-7 to 1e-6 accuracy) but do not show end-to-end speedups — the SCF savings are consumed by the CPU-bound gradient/Hessian code and the f64 refinement overhead needed for tight accuracy.
+Energies match PySCF CPU reference to ≤1e-5 Ha. Gradients match to ≤1e-5 (norm).
 
 ## How It Works
 
 The fork introduces a backend abstraction layer (`gpu4pyscf.lib.backend`) that auto-detects CuPy (NVIDIA), MLX (Apple Silicon), or NumPy (CPU fallback).
 
 On Apple Silicon:
-- **DF J/K contractions** run on Metal GPU in float32 via MLX, with float64 accumulation on CPU. For UKS, alpha and beta densities are batched into single GPU calls (one half-transform, one matmul-pair for J).
-- **XC grid integration** uses a custom Metal compute shader (`eval_ao`) for basis function evaluation, with GPU contraction of `Vxc` and on-GPU accumulation of `vmat`. Grid coords, weights, and shell data are pre-uploaded once per SCF cycle.
-- **Eigensolve, DIIS, energy** run on CPU in float64 via Accelerate/LAPACK
-- **Gradients, Hessians, TDDFT** use f64 refinement: the Metal-converged density is refined with a few CPU f64 SCF cycles before computing properties
+- **DF J/K contractions** run on Metal GPU in float32 via MLX, with float64 accumulation on CPU. For UKS, alpha and beta densities are batched into single GPU calls.
+- **XC grid integration** uses custom Metal compute shaders (`eval_ao` for basis functions up to deriv=2, fused `rho`/`Vxc` contraction). Grid data stays on GPU across batches.
+- **XC gradient** (`get_vxc`) uses Metal `eval_ao` deriv=2 + on-GPU `_gga_grad_sum_` contraction for both RKS and UKS. 4.4x faster than CPU.
+- **DF gradient Cholesky solve** reuses cached CDERI from the SCF via `L^{-T} @ (cderi @ D)` on GPU. 13x faster.
+- **Geometry optimization** uses `as_scanner()` with automatic refinement skipping on intermediate steps (f32 gradient error ~4e-4, within 4.5e-4 convergence threshold).
+- **Eigensolve, DIIS, energy** run on CPU in float64 via Accelerate/LAPACK.
+- **f64 refinement**: 3 f64 SCF cycles from the f32 density, applied before gradient/Hessian for precision. Metal get_jk is restored afterward for the next optimization step.
 
 Apple Silicon GPUs lack float64 hardware. The mixed-precision strategy (f32 GPU + f64 CPU accumulation) follows [Codina et al., JCTC 2025](https://pubs.acs.org/doi/10.1021/acs.jctc.5c01800).
-
-**Convergence:** Metal SCF uses `conv_tol = 1e-4` by default (instead of 1e-9) because f32 J/K noise gives a gradient-norm floor of ~1e-2 for larger molecules — tighter targets are unreachable. Energy is variational in the density, so f32-converged densities give energies accurate to ≤1e-5 Ha regardless, well within chemical accuracy. A final f64 refinement step is applied automatically before property calculations.
 
 ## Testing
 
 ```bash
-# Run all tests
-pytest
-
-# Backend unit + chemistry tests (116 tests)
-pytest gpu4pyscf/lib/backends/tests/ -v
-
-# Smoke tests for all features
-pytest tests/ -v
+pytest tests/ -v       # 30 tests covering SCF, DFT, gradients, geomopt, Hessian
 ```
 
-## Documentation
+## Known Limitations
 
-See [METAL_PORT.md](METAL_PORT.md) for the full technical documentation, including:
-- Architecture and file manifest
-- Metal kernel implementations
-- Mixed-precision strategy and prior art
-- CUDA-to-Metal translation notes
-- Benchmark details
+- **int3c2e_ip1 integrals** remain on CPU (f32 TRR precision gives ~0.1 gradient error; needs f64 GPU compute that Apple Silicon doesn't expose). A complete Metal kernel exists but is disabled.
+- **Hessian precision**: ~3% relative error from f32 CDERI in the SCF density. Gradients are not affected (different code path).
+- **MGGA functionals**: Metal XC gradient supports LDA and GGA only. MGGA (e.g. TPSS, SCAN) falls through to CPU.
+- **Large molecules**: CDERI disk cache grows with basis size (~300 MB for caffeine/def2-TZVPP). Stored in `~/.cache/gpu4pyscf/`.
 
 ## License
 
@@ -129,4 +138,3 @@ Apache 2.0 (same as gpu4pyscf and PySCF).
 - [PySCF](https://pyscf.org) — the quantum chemistry engine
 - [gpu4pyscf](https://github.com/pyscf/gpu4pyscf) — the original CUDA GPU acceleration layer
 - [MLX](https://github.com/ml-explore/mlx) — Apple's GPU array framework
-- [metal-float64](https://github.com/philipturner/metal-float64) — research on emulated double precision on Apple GPUs
