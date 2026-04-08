@@ -307,6 +307,187 @@ def _rys_from_boys_general_batch(nroots, fm):
     return roots, weights
 
 
+def _load_rys_tables():
+    """Load Rys Chebyshev interpolation tables from CUDA data file."""
+    import re, os
+    dat_path = os.path.join(os.path.dirname(__file__), '..', 'gvhf-rys', 'rys_roots_dat.cu')
+    with open(dat_path) as f:
+        text = f.read()
+    def _extract(name):
+        m = re.search(rf'{name}\[\]\s*=\s*\{{([^}}]+)\}}', text, re.DOTALL)
+        nums = re.findall(r'[-+]?\d+\.?\d*[eE][-+]?\d+', m.group(1))
+        return np.array([float(x) for x in nums], dtype=np.float64)
+    return {k: _extract(v) for k, v in [
+        ('rw', 'ROOT_RW_DATA'), ('sr0', 'ROOT_SMALLX_R0'), ('sr1', 'ROOT_SMALLX_R1'),
+        ('sw0', 'ROOT_SMALLX_W0'), ('sw1', 'ROOT_SMALLX_W1'),
+        ('lr', 'ROOT_LARGEX_R_DATA'), ('lw', 'ROOT_LARGEX_W_DATA')]}
+
+_rys_tbl = None
+def _get_rys_tbl():
+    global _rys_tbl
+    if _rys_tbl is None:
+        _rys_tbl = _load_rys_tables()
+    return _rys_tbl
+
+
+@nb.njit
+def _clenshaw_rys(T, nroots, rw, sr0, sr1, sw0, sw1, lr, lw, roots, weights, base_idx):
+    """Compute Rys roots/weights for one primitive via f64 Clenshaw."""
+    if T < 3e-7:
+        for r in range(nroots):
+            s = nroots * (nroots - 1) // 2 + r
+            roots[base_idx + r] = sr0[s] + sr1[s] * T
+            weights[base_idx + r] = sw0[s] + sw1[s] * T
+    elif T > 35.0 + 5.0 * nroots:
+        ix = 1.0 / T
+        sqix = np.sqrt(ix)
+        for r in range(nroots):
+            s = nroots * (nroots - 1) // 2 + r
+            roots[base_idx + r] = lr[s] * ix
+            weights[base_idx + r] = lw[s] * sqix
+    else:
+        it = min(int(T * 0.4), 39)
+        u = (T - it * 2.5) * 0.8 - 1.0
+        u2 = 2.0 * u
+        noff = 560 * nroots * (nroots - 1)
+        for r in range(nroots):
+            for rwidx in range(2):
+                b = noff + (2 * r + rwidx) * 560 + it
+                c0 = rw[b + 520]  # 13*40
+                c1 = rw[b + 480]  # 12*40
+                for nn in range(11, 0, -2):
+                    c2 = rw[b + nn * 40] - c1
+                    c3 = c0 + c1 * u2
+                    c1 = c2 + c3 * u2
+                    c0 = rw[b + (nn - 1) * 40] - c3
+                v = c0 + c1 * u
+                if rwidx == 0:
+                    roots[base_idx + r] = v
+                else:
+                    weights[base_idx + r] = v
+
+
+@nb.njit
+def _build_3c_tasks_nb(
+    nbas, shl0_aux, shl1_aux,
+    shell_l, shell_nprim, prim_off_arr, exps, coeffs,
+    shell_x, shell_y, shell_z,
+    nbas_orb, ncart_lut,
+    rw, sr0, sr1, sw0, sw1, lr, lw,
+    # Output (pre-allocated, oversized):
+    tasks, roots_flat, weights_flat, offsets,
+    meta_ish, meta_jsh, meta_ksh, meta_ts, meta_tc,
+    meta_nfi, meta_nfj, meta_nfk, meta_nout):
+    """Numba-JIT task builder: enumerate + T + Clenshaw + pack."""
+    PI52 = 34.986836655249725  # 2 * pi^2.5
+    task_count = 0
+    triple_count = 0
+    out_offset = 0
+
+    for ish in range(nbas_orb):
+        li = shell_l[ish]
+        if li > 3:
+            continue
+        nfi = ncart_lut[li]
+        for jsh in range(nbas_orb):
+            lj = shell_l[jsh]
+            if lj > 3:
+                continue
+            nfj = ncart_lut[lj]
+            dx = shell_x[ish] - shell_x[jsh]
+            dy = shell_y[ish] - shell_y[jsh]
+            dz = shell_z[ish] - shell_z[jsh]
+            rr_ab = dx * dx + dy * dy + dz * dz
+
+            for ksh in range(shl0_aux, shl1_aux):
+                ksh_g = nbas_orb + ksh  # global shell index
+                lk = shell_l[ksh_g]
+                if lk > 4:
+                    continue
+                nfk = ncart_lut[lk]
+                nroots = (li + 1 + lj + lk) // 2 + 1
+                n_out = 3 * nfi * nfj * nfk
+                npi = shell_nprim[ish]
+                npj = shell_nprim[jsh]
+                npk = shell_nprim[ksh_g]
+                t_start = task_count
+
+                for pi in range(npi):
+                    ai = exps[prim_off_arr[ish] + pi]
+                    ci = coeffs[prim_off_arr[ish] + pi]
+                    for pj in range(npj):
+                        aj = exps[prim_off_arr[jsh] + pj]
+                        cj = coeffs[prim_off_arr[jsh] + pj]
+                        aij = ai + aj
+                        eij = np.exp(-ai * aj / aij * rr_ab)
+                        px = (ai * shell_x[ish] + aj * shell_x[jsh]) / aij
+                        py = (ai * shell_y[ish] + aj * shell_y[jsh]) / aij
+                        pz = (ai * shell_z[ish] + aj * shell_z[jsh]) / aij
+                        coeff_ij = ci * cj * eij
+
+                        for pk in range(npk):
+                            ak = exps[prim_off_arr[ksh_g] + pk]
+                            ck = coeffs[prim_off_arr[ksh_g] + pk]
+                            aijk = aij + ak
+                            PCx = px - shell_x[ksh_g]
+                            PCy = py - shell_y[ksh_g]
+                            PCz = pz - shell_z[ksh_g]
+                            T = aij * ak / aijk * (PCx*PCx + PCy*PCy + PCz*PCz)
+                            prefac = coeff_ij * ck * PI52 / (aij * ak * np.sqrt(aijk))
+
+                            # Clenshaw Rys in f64
+                            _clenshaw_rys(T, nroots, rw, sr0, sr1, sw0, sw1,
+                                          lr, lw, roots_flat, weights_flat,
+                                          task_count * 6)
+
+                            # Pack task
+                            tc = task_count
+                            base = tc * 36
+                            tasks[base + 0] = aij
+                            tasks[base + 1] = ak
+                            tasks[base + 2] = px - shell_x[ish]  # PA
+                            tasks[base + 3] = py - shell_y[ish]
+                            tasks[base + 4] = pz - shell_z[ish]
+                            tasks[base + 5] = PCx  # PC
+                            tasks[base + 6] = PCy
+                            tasks[base + 7] = PCz
+                            tasks[base + 8] = dx  # AB (= Ri - Rj, but dx = xi-xj)
+                            tasks[base + 9] = dy
+                            tasks[base + 10] = dz
+                            tasks[base + 11] = prefac
+                            tasks[base + 12] = ai
+                            tasks[base + 13] = li
+                            tasks[base + 14] = lj
+                            tasks[base + 15] = lk
+                            tasks[base + 17] = nroots
+                            # Roots/weights: packed from roots_flat
+                            for r in range(nroots):
+                                tasks[base + 18 + r] = float(roots_flat[tc * 6 + r])
+                                tasks[base + 24 + r] = float(weights_flat[tc * 6 + r])
+                            tasks[base + 30] = PCx  # Rpq
+                            tasks[base + 31] = PCy
+                            tasks[base + 32] = PCz
+
+                            offsets[tc] = out_offset
+                            out_offset += n_out
+                            task_count += 1
+
+                tc_now = task_count - t_start
+                if tc_now > 0:
+                    meta_ish[triple_count] = ish
+                    meta_jsh[triple_count] = jsh
+                    meta_ksh[triple_count] = ksh
+                    meta_ts[triple_count] = t_start
+                    meta_tc[triple_count] = tc_now
+                    meta_nfi[triple_count] = nfi
+                    meta_nfj[triple_count] = nfj
+                    meta_nfk[triple_count] = nfk
+                    meta_nout[triple_count] = n_out
+                    triple_count += 1
+
+    return task_count, triple_count, out_offset
+
+
 def _precompute_bra_pairs(mol):
     """Precompute primitive pair data for all orbital shell pairs."""
     nbas = mol.nbas
@@ -680,11 +861,48 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
     if max_l_orb > 3 or max_l_aux > 4:
         return _cpu_fallback(mol, auxmol, shls_slice)
 
-    # Phase A: build tasks on CPU
-    tasks, offsets, meta, total_out = _build_3c_tasks(mol, auxmol, shl0_aux, shl1_aux)
+    # Phase A: build tasks on CPU using Numba (f64 Clenshaw Rys)
+    from gpu4pyscf.lib.metal_kernels.int3c2e_ip1_v2 import _pack_shell_data
+    (sx, sy, sz, sl_arr, snp_arr, spo_arr, exps_arr, coeffs_arr) = _pack_shell_data(mol, auxmol)
+    tbl = _get_rys_tbl()
 
-    if len(tasks) == 0 or total_out == 0:
+    # Pre-allocate oversized buffers (Numba writes into them)
+    max_tasks = 10_000_000  # generous upper bound
+    max_triples = 2_000_000
+    tasks_flat = np.zeros(max_tasks * TASK_STRIDE, dtype=np.float32)
+    roots_flat = np.zeros(max_tasks * 6, dtype=np.float64)
+    weights_flat = np.zeros(max_tasks * 6, dtype=np.float64)
+    offsets_buf = np.zeros(max_tasks, dtype=np.int32)
+    m_ish = np.zeros(max_triples, dtype=np.int32)
+    m_jsh = np.zeros(max_triples, dtype=np.int32)
+    m_ksh = np.zeros(max_triples, dtype=np.int32)
+    m_ts = np.zeros(max_triples, dtype=np.int32)
+    m_tc = np.zeros(max_triples, dtype=np.int32)
+    m_nfi = np.zeros(max_triples, dtype=np.int32)
+    m_nfj = np.zeros(max_triples, dtype=np.int32)
+    m_nfk = np.zeros(max_triples, dtype=np.int32)
+    m_nout = np.zeros(max_triples, dtype=np.int32)
+
+    n_tasks, n_meta, total_out = _build_3c_tasks_nb(
+        nbas, shl0_aux, shl1_aux,
+        sl_arr, snp_arr, spo_arr,
+        exps_arr.astype(np.float64), coeffs_arr.astype(np.float64),
+        sx.astype(np.float64), sy.astype(np.float64), sz.astype(np.float64),
+        nbas, _NCART_LUT,
+        tbl['rw'], tbl['sr0'], tbl['sr1'], tbl['sw0'], tbl['sw1'],
+        tbl['lr'], tbl['lw'],
+        tasks_flat, roots_flat, weights_flat, offsets_buf,
+        m_ish, m_jsh, m_ksh, m_ts, m_tc, m_nfi, m_nfj, m_nfk, m_nout)
+
+    if n_tasks == 0 or total_out == 0:
         return _cpu_fallback(mol, auxmol, shls_slice)
+
+    tasks = tasks_flat[:n_tasks * TASK_STRIDE].reshape(n_tasks, TASK_STRIDE)
+    offsets = offsets_buf[:n_tasks]
+    meta = [(int(m_ish[i]), int(m_jsh[i]), int(m_ksh[i]),
+             int(m_ts[i]), int(m_tc[i]),
+             int(m_nfi[i]), int(m_nfj[i]), int(m_nfk[i]), int(m_nout[i]))
+            for i in range(n_meta)]
 
     # Phase B: run Metal kernel
     task_gpu = mx.array(tasks.ravel())

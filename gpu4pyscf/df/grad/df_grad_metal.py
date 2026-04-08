@@ -223,7 +223,7 @@ def install_metal_int3c2e_ip1_patch():
         # the CPU is faster and gives f64 precision.
         intor_base = intor.replace('_sph', '').replace('_cart', '').replace('_spinor', '')
         if (intor_base != 'int3c2e_ip1' or aosym != 's1'
-                or mol.nao < 9999):  # int3c2e_ip1 v2: prim_idx sync issue (see commit)
+                or mol.nao < 9999):  # f32 TRR gives 0.1 grad error; needs f64 GPU
             return _original_wrapper(mol, auxmol, intor, aosym)
 
         # Load the Metal kernel module (avoid cupy-gated imports)
@@ -234,7 +234,7 @@ def install_metal_int3c2e_ip1_patch():
         else:
             _path = _os.path.join(
                 _os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))),
-                'lib', 'metal_kernels', 'int3c2e_ip1_v2.py')
+                'lib', 'metal_kernels', 'int3c2e_ip1.py')
             _spec = _ilu.spec_from_file_location(_modname, _path)
             _mod = _ilu.module_from_spec(_spec)
             _sys.modules[_modname] = _mod
@@ -247,7 +247,7 @@ def install_metal_int3c2e_ip1_patch():
                 shls_slice = (0, nbas, 0, nbas, 0, auxmol.nbas)
             # Caller passes aux indices 0-based; _int3c_wrapper would
             # add nbas for the compound mol, but we use auxmol directly.
-            return _mod.compute_int3c2e_ip1_v2(
+            return _mod.compute_int3c2e_ip1_metal(
                 mol, auxmol, shls_slice)
 
         return get_int3c
