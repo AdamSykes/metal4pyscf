@@ -350,6 +350,7 @@ def _patch_df_with_metal_jk(mf_df):
             return _original_reset(*args, **kwargs)
 
     dfobj.get_jk = _metal_get_jk
+    dfobj._metal_get_jk_saved = _metal_get_jk  # saved for gradient restore
     dfobj.reset = _metal_reset
 
     # Install Metal-accelerated DF gradient patch (Phase 1: CDERI reuse in
@@ -400,6 +401,13 @@ def _patch_df_with_metal_jk(mf_df):
     _original_ngm = mf_df.nuc_grad_method
     def _refined_nuc_grad_method():
         _refine_to_f64(mf_df)
+        # Restore Metal get_jk for subsequent SCF cycles (geomopt).
+        # _refine_to_f64 leaves CPU get_jk (needed by Hessian/TDDFT),
+        # but the gradient path re-patches for next SCF speed.
+        if hasattr(mf_df, 'with_df') and hasattr(mf_df.with_df, '_original_get_jk'):
+            _metal_jk = getattr(mf_df.with_df, '_metal_get_jk_saved', None)
+            if _metal_jk is not None:
+                mf_df.with_df.get_jk = _metal_jk
         grad = _original_ngm()
         # Patch as_scanner so geomopt skips refinement on intermediate steps
         _orig_as_scanner = grad.as_scanner
@@ -452,10 +460,8 @@ def _refine_to_f64(mf):
         return
     if getattr(mf, '_metal_skip_refine', False):
         return
-    # Temporarily switch to CPU f64 J/K, keeping the Metal version for later
-    metal_get_jk = None
+    # Switch to CPU f64 J/K for refinement
     if hasattr(mf, 'with_df') and hasattr(mf.with_df, '_original_get_jk'):
-        metal_get_jk = mf.with_df.get_jk
         mf.with_df.get_jk = mf.with_df._original_get_jk
     dm0 = mf.make_rdm1()
     mf.converged = False
@@ -467,9 +473,9 @@ def _refine_to_f64(mf):
     mf.kernel(dm0=dm0)
     mf.conv_tol = saved_tol
     mf.max_cycle = saved_max
-    # Restore Metal f32 J/K for next SCF cycle (critical for geomopt)
-    if metal_get_jk is not None:
-        mf.with_df.get_jk = metal_get_jk
+    # Note: Metal get_jk is NOT restored here. For gradient geomopt,
+    # the _refined_nuc_grad_method wrapper re-patches it. For Hessian/TDDFT,
+    # CPU get_jk stays (they need f64 precision).
 
 remove_overlap_zero_eigenvalue = getattr(__config__, 'scf_hf_remove_overlap_zero_eigenvalue', True)
 overlap_zero_eigenvalue_threshold = getattr(__config__, 'scf_hf_overlap_zero_eigenvalue_threshold', 1e-6)
