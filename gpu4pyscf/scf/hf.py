@@ -394,11 +394,28 @@ def _patch_df_with_metal_jk(mf_df):
         elif _cls_name == 'DFUKS':
             _patch_dft_veff_metal_uks(mf_df)
 
-    # Override nuc_grad_method and Hessian to do f64 refinement first
+    # Override nuc_grad_method to do f64 refinement first.
+    # The returned grad object's as_scanner() is patched to set
+    # _metal_skip_refine=True during optimization, saving ~1.4s per step.
     _original_ngm = mf_df.nuc_grad_method
     def _refined_nuc_grad_method():
         _refine_to_f64(mf_df)
-        return _original_ngm()
+        grad = _original_ngm()
+        # Patch as_scanner so geomopt skips refinement on intermediate steps
+        _orig_as_scanner = grad.as_scanner
+        def _fast_as_scanner():
+            scanner = _orig_as_scanner()
+            _orig_call = scanner.__call__
+            def _call_skip_refine(mol_or_geom, **kw):
+                mf_df._metal_skip_refine = True
+                try:
+                    return _orig_call(mol_or_geom, **kw)
+                finally:
+                    mf_df._metal_skip_refine = False
+            scanner.__call__ = _call_skip_refine
+            return scanner
+        grad.as_scanner = _fast_as_scanner
+        return grad
     mf_df.nuc_grad_method = _refined_nuc_grad_method
 
     _original_hess = mf_df.Hessian
