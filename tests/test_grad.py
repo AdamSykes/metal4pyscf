@@ -19,6 +19,13 @@ class TestGradients:
         g = RKS(h2o, xc='B3LYP').run(verbose=0).nuc_grad_method().kernel()
         assert np.linalg.norm(g - g_ref) < 1e-5
 
+    def test_df_uks(self, oh_radical):
+        from gpu4pyscf.dft import UKS
+        from pyscf.dft import uks as uks_cpu
+        g_ref = uks_cpu.UKS(oh_radical, xc='B3LYP').density_fit().run().nuc_grad_method().kernel()
+        g = UKS(oh_radical, xc='B3LYP').density_fit().run(verbose=0).nuc_grad_method().kernel()
+        assert np.linalg.norm(g - g_ref) < 1e-4
+
     def test_df_rks(self, h2o):
         from gpu4pyscf.dft import RKS
         g_ref = rks_cpu.RKS(h2o, xc='B3LYP').density_fit().run().nuc_grad_method().kernel()

@@ -10,6 +10,7 @@ import numpy as np
 from gpu4pyscf.lib.metal_kernels.eval_ao import _prepare_shell_data
 from gpu4pyscf.lib.metal_kernels.fused_xc import (
     fused_rho_vxc, _batched_rho_vxc_uks, _batched_vxc_grad,
+    _batched_vxc_grad_uks,
 )
 
 
@@ -68,5 +69,27 @@ def nr_rks_grad_metal(ni, mol, grids, xc_code, dm, max_memory=2000):
 
     return _batched_vxc_grad(
         mol, coords, dm, weights, ni, xc_code, xctype,
+        shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping,
+        shell_data_gpu)
+
+
+def nr_uks_grad_metal(ni, mol, grids, xc_code, dms, max_memory=2000):
+    """Metal GPU XC nuclear-gradient contraction (UKS).
+
+    Drop-in replacement for pyscf.grad.uks.get_vxc with spin=1.
+    dms: (2, nao, nao) — alpha/beta density matrices.
+    Returns (exc=None, -vmat) with vmat shape (2, 3, nao, nao).
+    """
+    xctype = ni._xc_type(xc_code)
+    shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping, shell_data_gpu = \
+        _prepare_shell_data(mol)
+
+    coords = np.asarray(grids.coords)
+    weights = np.asarray(grids.weights)
+    dms = np.asarray(dms)
+    dm_a, dm_b = dms[0], dms[1]
+
+    return _batched_vxc_grad_uks(
+        mol, coords, dm_a, dm_b, weights, ni, xc_code, xctype,
         shell_data, exps_gpu, coeffs_gpu, ncart_total, shell_mapping,
         shell_data_gpu)

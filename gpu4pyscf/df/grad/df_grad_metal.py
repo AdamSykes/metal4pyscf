@@ -173,13 +173,8 @@ def install_metal_vxc_grad_patch():
         if xctype not in ('LDA', 'GGA'):
             return _original_get_vxc(ni, mol, grids, xc_code, dms,
                                      relativity, hermi, max_memory, verbose)
-        # RKS only for Phase 3 — dms is (nao, nao). UKS would pass (2, nao, nao).
         dms_arr = np.asarray(dms)
-        if dms_arr.ndim == 3:
-            return _original_get_vxc(ni, mol, grids, xc_code, dms,
-                                     relativity, hermi, max_memory, verbose)
-        # Delegate to Metal backend via isolated loader to avoid pulling
-        # gpu4pyscf.dft.__init__ through its CuPy-gated imports.
+        # Load Metal backend (isolated loader avoids CuPy-gated imports)
         import importlib.util as _ilu, os as _os, sys as _sys
         _modname = 'gpu4pyscf_numint_metal_loader'
         if _modname in _sys.modules:
@@ -192,10 +187,34 @@ def install_metal_vxc_grad_patch():
             _mod = _ilu.module_from_spec(_spec)
             _sys.modules[_modname] = _mod
             _spec.loader.exec_module(_mod)
-        return _mod.nr_rks_grad_metal(ni, mol, grids, xc_code, dms_arr,
-                                      max_memory)
+        if dms_arr.ndim == 2:
+            # RKS: single density matrix
+            return _mod.nr_rks_grad_metal(ni, mol, grids, xc_code,
+                                          dms_arr, max_memory)
+        elif dms_arr.ndim == 3 and dms_arr.shape[0] == 2:
+            # UKS: alpha/beta density matrices
+            return _mod.nr_uks_grad_metal(ni, mol, grids, xc_code,
+                                          dms_arr, max_memory)
+        else:
+            return _original_get_vxc(ni, mol, grids, xc_code, dms,
+                                     relativity, hermi, max_memory, verbose)
 
     _grad_rks.get_vxc = _get_vxc_dispatcher
+    # Also patch UKS get_vxc (used by pyscf.df.grad.uks)
+    from pyscf.grad import uks as _grad_uks
+    _original_get_vxc_uks = _grad_uks.get_vxc
+    def _get_vxc_uks_dispatcher(ni, mol, grids, xc_code, dms, relativity=0,
+                                hermi=1, max_memory=2000, verbose=None):
+        if not getattr(ni, '_metal_enabled', False):
+            return _original_get_vxc_uks(ni, mol, grids, xc_code, dms,
+                                          relativity, hermi, max_memory, verbose)
+        xctype = ni._xc_type(xc_code)
+        if xctype not in ('LDA', 'GGA'):
+            return _original_get_vxc_uks(ni, mol, grids, xc_code, dms,
+                                          relativity, hermi, max_memory, verbose)
+        return _get_vxc_dispatcher(ni, mol, grids, xc_code, dms,
+                                    relativity, hermi, max_memory, verbose)
+    _grad_uks.get_vxc = _get_vxc_uks_dispatcher
     _vxc_grad_patched = True
 
 

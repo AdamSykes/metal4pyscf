@@ -760,3 +760,119 @@ def _batched_vxc_grad(mol, coords, dm, weights, ni, xc_code, xctype,
     vmat = np.array(vmat_gpu, dtype=np.float64)
     # PySCF convention: nabla_X = -nabla_x.
     return None, -vmat
+
+
+def _batched_vxc_grad_uks(mol, coords, dm_a, dm_b, weights, ni, xc_code,
+                           xctype, shell_data, exps_gpu, coeffs_gpu,
+                           ncart_total, shell_mapping, shell_data_gpu):
+    """Metal GPU XC nuclear-gradient contraction (UKS).
+
+    Same as _batched_vxc_grad but for unrestricted DFT: computes rho_a and
+    rho_b separately, calls eval_xc_eff with spin=1, and produces a
+    (2, 3, nao, nao) output vmat for alpha and beta.
+
+    Returns:
+        (None, -vmat) where vmat is (2, 3, nao, nao) f64.
+    """
+    if xctype not in ('LDA', 'GGA'):
+        raise NotImplementedError(
+            f'_batched_vxc_grad_uks: xctype={xctype} not supported')
+
+    nao = mol.nao
+    ngrids = coords.shape[0]
+    dm_a_gpu = mx.array(np.asarray(dm_a, dtype=np.float32))
+    dm_b_gpu = mx.array(np.asarray(dm_b, dtype=np.float32))
+    ao_deriv = 2 if xctype == 'GGA' else 1
+
+    gridx_all = mx.array(coords[:, 0].astype(np.float32))
+    gridy_all = mx.array(coords[:, 1].astype(np.float32))
+    gridz_all = mx.array(coords[:, 2].astype(np.float32))
+
+    vmat_a_gpu = mx.zeros((3, nao, nao), dtype=mx.float32)
+    vmat_b_gpu = mx.zeros((3, nao, nao), dtype=mx.float32)
+    BATCH = 20000
+
+    for p0 in range(0, ngrids, BATCH):
+        p1 = min(p0 + BATCH, ngrids)
+        ng = p1 - p0
+        wt = weights[p0:p1]
+
+        ao_gpu = _eval_ao_batch_gpu(
+            mol, gridx_all[p0:p1], gridy_all[p0:p1], gridz_all[p0:p1],
+            ao_deriv, shell_data_gpu, exps_gpu, coeffs_gpu,
+            ncart_total, shell_mapping, ng)
+
+        ao_val = ao_gpu[0]
+        tmp_a = dm_a_gpu @ ao_val
+        tmp_b = dm_b_gpu @ ao_val
+        if xctype == 'LDA':
+            rho_a_gpu = mx.sum(ao_val * tmp_a, axis=0)
+            rho_b_gpu = mx.sum(ao_val * tmp_b, axis=0)
+            mx.eval(rho_a_gpu, rho_b_gpu)
+            rho_a = np.array(rho_a_gpu, dtype=np.float64)
+            rho_b = np.array(rho_b_gpu, dtype=np.float64)
+        else:
+            r0a = mx.sum(ao_val * tmp_a, axis=0)
+            r1a = 2.0 * mx.sum(ao_gpu[1] * tmp_a, axis=0)
+            r2a = 2.0 * mx.sum(ao_gpu[2] * tmp_a, axis=0)
+            r3a = 2.0 * mx.sum(ao_gpu[3] * tmp_a, axis=0)
+            r0b = mx.sum(ao_val * tmp_b, axis=0)
+            r1b = 2.0 * mx.sum(ao_gpu[1] * tmp_b, axis=0)
+            r2b = 2.0 * mx.sum(ao_gpu[2] * tmp_b, axis=0)
+            r3b = 2.0 * mx.sum(ao_gpu[3] * tmp_b, axis=0)
+            mx.eval(r0a, r1a, r2a, r3a, r0b, r1b, r2b, r3b)
+            rho_a = np.empty((4, ng), dtype=np.float64)
+            rho_b = np.empty((4, ng), dtype=np.float64)
+            rho_a[0] = np.array(r0a); rho_a[1] = np.array(r1a)
+            rho_a[2] = np.array(r2a); rho_a[3] = np.array(r3a)
+            rho_b[0] = np.array(r0b); rho_b[1] = np.array(r1b)
+            rho_b[2] = np.array(r2b); rho_b[3] = np.array(r3b)
+
+        # XC kernel with spin=1 → vxc shape (2, ncomp, ngrids)
+        vxc = ni.eval_xc_eff(xc_code, (rho_a, rho_b), deriv=1,
+                              xctype=xctype, spin=1)[1]
+        wv = wt * vxc  # (2, ncomp, ng)
+
+        # Apply the SAME contraction for each spin channel
+        for s, (dm_s_gpu, vmat_s_gpu) in enumerate(
+                [(dm_a_gpu, vmat_a_gpu), (dm_b_gpu, vmat_b_gpu)]):
+            wv_s = wv[s]  # (ncomp, ng) for this spin
+            if xctype == 'LDA':
+                wv0 = mx.array(wv_s[0].astype(np.float32))
+                aow = ao_val * wv0[None, :]
+                vm0 = ao_gpu[1] @ mx.transpose(aow)
+                vm1 = ao_gpu[2] @ mx.transpose(aow)
+                vm2 = ao_gpu[3] @ mx.transpose(aow)
+            else:
+                wv_s = wv_s.copy()
+                wv_s[0] *= 0.5
+                w0 = mx.array(wv_s[0].astype(np.float32))
+                w1 = mx.array(wv_s[1].astype(np.float32))
+                w2 = mx.array(wv_s[2].astype(np.float32))
+                w3 = mx.array(wv_s[3].astype(np.float32))
+                aow_1 = (ao_gpu[0]*w0[None,:] + ao_gpu[1]*w1[None,:]
+                         + ao_gpu[2]*w2[None,:] + ao_gpu[3]*w3[None,:])
+                vm0 = ao_gpu[1] @ mx.transpose(aow_1)
+                vm1 = ao_gpu[2] @ mx.transpose(aow_1)
+                vm2 = ao_gpu[3] @ mx.transpose(aow_1)
+                aow_X = (ao_gpu[1]*w0[None,:] + ao_gpu[4]*w1[None,:]
+                         + ao_gpu[5]*w2[None,:] + ao_gpu[6]*w3[None,:])
+                aow_Y = (ao_gpu[2]*w0[None,:] + ao_gpu[5]*w1[None,:]
+                         + ao_gpu[7]*w2[None,:] + ao_gpu[8]*w3[None,:])
+                aow_Z = (ao_gpu[3]*w0[None,:] + ao_gpu[6]*w1[None,:]
+                         + ao_gpu[8]*w2[None,:] + ao_gpu[9]*w3[None,:])
+                vm0 = vm0 + aow_X @ mx.transpose(ao_val)
+                vm1 = vm1 + aow_Y @ mx.transpose(ao_val)
+                vm2 = vm2 + aow_Z @ mx.transpose(ao_val)
+
+            vm_stack = mx.stack([vm0, vm1, vm2], axis=0)
+            if s == 0:
+                vmat_a_gpu = vmat_a_gpu + vm_stack
+            else:
+                vmat_b_gpu = vmat_b_gpu + vm_stack
+        mx.eval(vmat_a_gpu, vmat_b_gpu)
+
+    vmat_a = np.array(vmat_a_gpu, dtype=np.float64)
+    vmat_b = np.array(vmat_b_gpu, dtype=np.float64)
+    vmat = np.stack([vmat_a, vmat_b])
+    return None, -vmat
