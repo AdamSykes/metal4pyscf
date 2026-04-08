@@ -424,14 +424,21 @@ def _patch_df_with_metal_jk(mf_df):
 def _refine_to_f64(mf):
     """Refine f32-converged SCF to f64 before gradient/Hessian.
 
-    Runs a few f64 SCF cycles from the f32-converged density to obtain
-    f64-precision mo_coeff / mo_energy. The f32 density is already close
-    to the variational minimum, so 3 cycles suffice (vs ~8-10 from scratch).
+    Temporarily switches to CPU f64 J/K for 3 SCF cycles, then restores
+    Metal f32 J/K so subsequent SCF calls (e.g. geomopt steps) remain fast.
+
+    Can be skipped by setting mf._metal_skip_refine = True (useful for
+    intermediate geometry optimization steps where ~4e-4 gradient error
+    from f32 density is acceptable).
     """
     if not getattr(mf, 'converged', False):
         return
-    # Unpatch Metal f32 J/K if present
+    if getattr(mf, '_metal_skip_refine', False):
+        return
+    # Temporarily switch to CPU f64 J/K, keeping the Metal version for later
+    metal_get_jk = None
     if hasattr(mf, 'with_df') and hasattr(mf.with_df, '_original_get_jk'):
+        metal_get_jk = mf.with_df.get_jk
         mf.with_df.get_jk = mf.with_df._original_get_jk
     dm0 = mf.make_rdm1()
     mf.converged = False
@@ -443,6 +450,9 @@ def _refine_to_f64(mf):
     mf.kernel(dm0=dm0)
     mf.conv_tol = saved_tol
     mf.max_cycle = saved_max
+    # Restore Metal f32 J/K for next SCF cycle (critical for geomopt)
+    if metal_get_jk is not None:
+        mf.with_df.get_jk = metal_get_jk
 
 remove_overlap_zero_eigenvalue = getattr(__config__, 'scf_hf_remove_overlap_zero_eigenvalue', True)
 overlap_zero_eigenvalue_threshold = getattr(__config__, 'scf_hf_overlap_zero_eigenvalue_threshold', 1e-6)
