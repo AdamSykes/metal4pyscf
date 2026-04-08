@@ -15,6 +15,7 @@ GPU-side work: Boys + Rys + TRR + HRR + derivative per primitive.
 
 import numpy as np
 import mlx.core as mx
+import numba as nb
 from math import pi, sqrt
 from pyscf.gto.moleintor import getints, make_cintopt
 
@@ -129,13 +130,15 @@ int out_base = out_offsets[tid];
 for (int i = 0; i < n_out; i++) int_out[out_base + i] = 0.0f;
 
 // Loop over primitive triples
+int prim_idx = prim_offsets[tid];  // starting index into pre-computed roots buffer
 for (int pi = 0; pi < npi; pi++) {
 float ai = exps[offi+pi], ci_c = coeffs[offi+pi];
 for (int pj = 0; pj < npj; pj++) {
 float aj = exps[offj+pj], cj_c = coeffs[offj+pj];
 float aij = ai + aj;
 float eij = exp(-ai * aj / aij * rr_ab);
-if (eij < 1e-14f) continue;
+// No screening: prim_idx must stay in sync with pre-computed roots buffer.
+// Zero-prefac primitives produce zero integrals harmlessly.
 float px = (ai*ax + aj*bx)/aij, py = (ai*ay + aj*by)/aij, pz = (ai*az + aj*bz)/aij;
 float PAx = px-ax, PAy = py-ay, PAz = pz-az;
 float coeff_ij = ci_c * cj_c * eij;
@@ -180,68 +183,14 @@ if (T < 1e-7f) {
     }
 }
 
-// --- Rys roots/weights via Chebyshev lookup table (Clenshaw recurrence) ---
-// Table layout: per nroots n, offset = 560*n*(n-1), entries for 2n arrays
-// (n roots + n weights), each 14 coefficients × 40 intervals = 560 entries.
+// --- Rys roots/weights: read pre-computed values from CPU buffer ---
+// (f64 Clenshaw on CPU → f32 roots/weights passed via buffer)
 float rys_r[6] = {0,0,0,0,0,0}, rys_w[6] = {0,0,0,0,0,0};
-float x_rys = T;  // Boys argument = Rys argument
-if (x_rys < 3.0e-7f) {
-    // Small x: linear approximation from SMALLX tables
-    for (int r = 0; r < nroots; r++) {
-        int sidx = nroots*(nroots-1)/2 + r;
-        rys_r[r] = smallx_r0[sidx] + smallx_r1[sidx] * x_rys;
-        rys_w[r] = smallx_w0[sidx] + smallx_w1[sidx] * x_rys;
-    }
-} else if (x_rys > 35.0f + 5.0f * float(nroots)) {
-    // Large x: asymptotic
-    float inv_x = 1.0f / x_rys;
-    float sqrt_inv_x = sqrt(inv_x);
-    for (int r = 0; r < nroots; r++) {
-        int sidx = nroots*(nroots-1)/2 + r;
-        rys_r[r] = largex_r[sidx] * inv_x;
-        rys_w[r] = largex_w[sidx] * sqrt_inv_x;
-    }
-} else {
-    // Medium x: Chebyshev interpolation with Clenshaw recurrence
-    int it = min((int)(x_rys * 0.4f), 39);
-    float u = (x_rys - float(it) * 2.5f) * 0.8f - 1.0f;
-    float u2 = 2.0f * u;
-    int nroots_off = 560 * nroots * (nroots - 1);  // offset into rw_table for this nroots
-    for (int r = 0; r < nroots; r++) {
-        // Root coefficients: nroots_off + (2*r)*560
-        // Weight coefficients: nroots_off + (2*r+1)*560
-        for (int rw = 0; rw < 2; rw++) {  // 0=root, 1=weight
-            int base = nroots_off + (2*r + rw) * 560 + it;
-            // Clenshaw recurrence with Kahan compensation (degree=13, odd).
-            // Standard f32 Clenshaw loses ~3 digits over 7 iterations;
-            // Kahan summation recovers them by tracking the rounding error.
-            float c0 = rw_table[base + 13*40];
-            float c1 = rw_table[base + 12*40];
-            float e0 = 0.0f, e1 = 0.0f;  // compensation terms
-            for (int n = 11; n >= 1; n -= 2) {
-                float c2 = rw_table[base + n*40] - c1;
-                // c3 = c0 + c1*u2 with compensation
-                float prod = c1 * u2;
-                float y3 = prod - e0;
-                float c3 = c0 + y3;
-                e0 = (c3 - c0) - y3;
-                // c1 = c2 + c3*u2 with compensation
-                float prod2 = c3 * u2;
-                float y1 = (prod2 + c2) - e1;
-                c1 = y1;
-                e1 = (c1) - y1;
-                // c0 = table - c3
-                c0 = rw_table[base + (n-1)*40] - c3;
-            }
-            float val = c0 + c1 * u;
-            if (rw == 0) {
-                rys_r[r] = val;  // table stores t^2 directly
-            } else {
-                rys_w[r] = val;
-            }
-        }
-    }
+for (int r = 0; r < nroots; r++) {
+    rys_r[r] = precomp_roots[prim_idx * 6 + r];
+    rys_w[r] = precomp_weights[prim_idx * 6 + r];
 }
+prim_idx++;
 
 // --- TRR + HRR + derivative (same as v1 kernel) ---
 float PA[3] = {PAx, PAy, PAz};
@@ -321,9 +270,8 @@ _kernel_v2 = mx.fast.metal_kernel(
     name='int3c2e_ip1_v2',
     input_names=['triples', 'shell_x', 'shell_y', 'shell_z',
                  'shell_l', 'shell_nprim', 'prim_off',
-                 'exps', 'coeffs', 'out_offsets',
-                 'rw_table', 'smallx_r0', 'smallx_r1',
-                 'smallx_w0', 'smallx_w1', 'largex_r', 'largex_w'],
+                 'exps', 'coeffs', 'out_offsets', 'prim_offsets',
+                 'precomp_roots', 'precomp_weights'],
     output_names=['int_out'],
     header=_HEADER_V2,
     source=_SOURCE_V2,
@@ -334,6 +282,101 @@ _kernel_v2 = mx.fast.metal_kernel(
 # ---------------------------------------------------------------------------
 # Python dispatch (minimal — just enumerate shell triples + pack data)
 # ---------------------------------------------------------------------------
+
+@nb.njit
+def _clenshaw_rys_batch(T_arr, nroots_arr, rw_table, sx_r0, sx_r1,
+                         sx_w0, sx_w1, lx_r, lx_w, roots_out, weights_out):
+    """Numba-JIT: Clenshaw Rys for a flat array of (T, nroots) pairs."""
+    n = len(T_arr)
+    for i in range(n):
+        T = T_arr[i]
+        nroots = nroots_arr[i]
+        if T < 3e-7:
+            for r in range(nroots):
+                sidx = nroots * (nroots - 1) // 2 + r
+                roots_out[i * 6 + r] = float(sx_r0[sidx] + sx_r1[sidx] * T)
+                weights_out[i * 6 + r] = float(sx_w0[sidx] + sx_w1[sidx] * T)
+        elif T > 35.0 + 5.0 * nroots:
+            inv_x = 1.0 / T
+            sqrt_inv = np.sqrt(inv_x)
+            for r in range(nroots):
+                sidx = nroots * (nroots - 1) // 2 + r
+                roots_out[i * 6 + r] = float(lx_r[sidx] * inv_x)
+                weights_out[i * 6 + r] = float(lx_w[sidx] * sqrt_inv)
+        else:
+            it = min(int(T * 0.4), 39)
+            u = (T - it * 2.5) * 0.8 - 1.0
+            u2 = 2.0 * u
+            nroots_off = 560 * nroots * (nroots - 1)
+            for r in range(nroots):
+                for rw in range(2):
+                    base = nroots_off + (2 * r + rw) * 560 + it
+                    c0 = rw_table[base + 520]  # 13*40
+                    c1 = rw_table[base + 480]  # 12*40
+                    c2_ = 0.0; c3_ = 0.0
+                    for nn in range(11, 0, -2):
+                        c2_ = rw_table[base + nn * 40] - c1
+                        c3_ = c0 + c1 * u2
+                        c1 = c2_ + c3_ * u2
+                        c0 = rw_table[base + (nn - 1) * 40] - c3_
+                    val = c0 + c1 * u
+                    if rw == 0:
+                        roots_out[i * 6 + r] = float(val)
+                    else:
+                        weights_out[i * 6 + r] = float(val)
+
+
+def _compute_rys_for_triples(n_triples, triples_arr, sl, snp, spo,
+                              exps_f64, sx_f64, sy_f64, sz_f64,
+                              prim_offsets, rys_tables):
+    """Compute f64 Rys roots/weights for all primitives. Returns (roots, weights) as f32."""
+    rw64 = rys_tables['rw_table'].astype(np.float64)
+
+    # First: compute T and nroots for each primitive
+    # Total primitives from prim_counts
+    total_prims = 0
+    for t in range(n_triples):
+        ish, jsh, ksh = int(triples_arr[t, 0]), int(triples_arr[t, 1]), int(triples_arr[t, 2])
+        total_prims += int(snp[ish]) * int(snp[jsh]) * int(snp[ksh])
+
+    T_arr = np.zeros(total_prims, dtype=np.float64)
+    nroots_arr = np.zeros(total_prims, dtype=np.int64)
+
+    pidx = 0
+    for t in range(n_triples):
+        ish, jsh, ksh = int(triples_arr[t, 0]), int(triples_arr[t, 1]), int(triples_arr[t, 2])
+        li = int(sl[ish]); lj = int(sl[jsh]); lk = int(sl[ksh])
+        nroots = (li + 1 + lj + lk) // 2 + 1
+        npi = int(snp[ish]); npj = int(snp[jsh]); npk = int(snp[ksh])
+        rr_ab = float((sx_f64[ish]-sx_f64[jsh])**2 + (sy_f64[ish]-sy_f64[jsh])**2 + (sz_f64[ish]-sz_f64[jsh])**2)
+        for pi in range(npi):
+            ai = float(exps_f64[spo[ish]+pi])
+            for pj in range(npj):
+                aj = float(exps_f64[spo[jsh]+pj])
+                aij = ai + aj
+                px = (ai*sx_f64[ish]+aj*sx_f64[jsh])/aij
+                py = (ai*sy_f64[ish]+aj*sy_f64[jsh])/aij
+                pz = (ai*sz_f64[ish]+aj*sz_f64[jsh])/aij
+                for pk in range(npk):
+                    ak = float(exps_f64[spo[ksh]+pk])
+                    aijk = aij + ak
+                    PCx = px-sx_f64[ksh]; PCy = py-sy_f64[ksh]; PCz = pz-sz_f64[ksh]
+                    T_arr[pidx] = aij*ak/aijk * (PCx*PCx+PCy*PCy+PCz*PCz)
+                    nroots_arr[pidx] = nroots
+                    pidx += 1
+
+    roots_buf = np.zeros(total_prims * 6, dtype=np.float32)
+    weights_buf = np.zeros(total_prims * 6, dtype=np.float32)
+    _clenshaw_rys_batch(T_arr, nroots_arr, rw64,
+                         rys_tables['smallx_r0'].astype(np.float64),
+                         rys_tables['smallx_r1'].astype(np.float64),
+                         rys_tables['smallx_w0'].astype(np.float64),
+                         rys_tables['smallx_w1'].astype(np.float64),
+                         rys_tables['largex_r'].astype(np.float64),
+                         rys_tables['largex_w'].astype(np.float64),
+                         roots_buf, weights_buf)
+    return roots_buf, weights_buf, total_prims
+
 
 def _pack_shell_data(mol, auxmol):
     """Pack shell metadata into flat arrays for GPU."""
@@ -380,7 +423,13 @@ def _pack_shell_data(mol, auxmol):
 
 
 def compute_int3c2e_ip1_v2(mol, auxmol, shls_slice=None):
-    """Compute int3c2e_ip1 on Metal GPU (v2: shell-triple-per-thread)."""
+    """Compute int3c2e_ip1 on Metal GPU (v2: shell-triple-per-thread).
+
+    Rys roots/weights are computed on CPU in f64 (Numba-JIT Clenshaw
+    interpolation from the CUDA Chebyshev lookup tables) and passed to
+    the GPU kernel as f32 buffers. This gives f64-accurate roots with
+    f32 GPU compute speed.
+    """
     import numba as nb
 
     nbas = mol.nbas
@@ -398,13 +447,14 @@ def compute_int3c2e_ip1_v2(mol, auxmol, shls_slice=None):
     # Pack shell data
     (sx, sy, sz, sl, snp, spo, exps, coeffs) = _pack_shell_data(mol, auxmol)
 
-    # Enumerate shell triples + compute output offsets
+    # Enumerate shell triples + compute output offsets + primitive counts
     ao_loc_c = mol.ao_loc_nr(cart=True)
     aux_loc_c = auxmol.ao_loc_nr(cart=True)
     p0_aux = aux_loc_c[shl0_aux]
 
     triples = []
     out_sizes = []
+    prim_counts = []
     for ish in range(nbas):
         li = mol.bas_angular(ish)
         if li > 3:
@@ -423,32 +473,47 @@ def compute_int3c2e_ip1_v2(mol, auxmol, shls_slice=None):
                     continue
                 k0 = aux_loc_c[ksh] - p0_aux
                 nfk = int(_NCART_LUT[lk])
+                nprims = int(snp[ish]) * int(snp[jsh]) * int(snp[nbas + ksh])
                 triples.append((ish, jsh, nbas + ksh, i0, j0, k0))
                 out_sizes.append(3 * nfi * nfj * nfk)
+                prim_counts.append(nprims)
 
     if not triples:
         return _cpu_fallback(mol, auxmol, shls_slice)
 
     triples_arr = np.array(triples, dtype=np.int32)
     out_sizes_arr = np.array(out_sizes, dtype=np.int64)
+    prim_counts_arr = np.array(prim_counts, dtype=np.int32)
     offsets = np.zeros(len(triples), dtype=np.int32)
     if len(triples) > 1:
         offsets[1:] = np.cumsum(out_sizes_arr[:-1]).astype(np.int32)
     total_out = int(out_sizes_arr.sum())
     n_triples = len(triples)
 
+    # Primitive offsets per triple (for indexing into roots buffer)
+    prim_offsets = np.zeros(n_triples, dtype=np.int32)
+    if n_triples > 1:
+        prim_offsets[1:] = np.cumsum(prim_counts_arr[:-1])
+    total_prims = int(prim_counts_arr.sum())
+
+    # Compute Rys roots/weights on CPU in f64 (Numba Clenshaw)
+    rys_tables_raw = _load_rys_tables()
+    roots_buf, weights_buf, total_prims = _compute_rys_for_triples(
+        n_triples, triples_arr, sl, snp, spo,
+        exps.astype(np.float64), sx.astype(np.float64),
+        sy.astype(np.float64), sz.astype(np.float64),
+        prim_offsets, rys_tables_raw)
+
     # Launch Metal kernel
-    THREADS = 64  # lower than 256: each thread does more work (primitive loop)
+    THREADS = 64
     grid_size = ((n_triples + THREADS - 1) // THREADS) * THREADS
 
-    rys = _get_rys_tables()
     result = _kernel_v2(
         inputs=[mx.array(triples_arr.ravel()), mx.array(sx), mx.array(sy),
                 mx.array(sz), mx.array(sl), mx.array(snp), mx.array(spo),
                 mx.array(exps), mx.array(coeffs), mx.array(offsets),
-                rys['rw_table'], rys['smallx_r0'], rys['smallx_r1'],
-                rys['smallx_w0'], rys['smallx_w1'],
-                rys['largex_r'], rys['largex_w']],
+                mx.array(prim_offsets),
+                mx.array(roots_buf), mx.array(weights_buf)],
         grid=(grid_size, 1, 1),
         threadgroup=(min(THREADS, n_triples), 1, 1),
         output_shapes=[(total_out,)],
