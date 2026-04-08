@@ -212,13 +212,25 @@ if (x_rys < 3.0e-7f) {
         // Weight coefficients: nroots_off + (2*r+1)*560
         for (int rw = 0; rw < 2; rw++) {  // 0=root, 1=weight
             int base = nroots_off + (2*r + rw) * 560 + it;
-            // Clenshaw recurrence (degree=13, odd)
+            // Clenshaw recurrence with Kahan compensation (degree=13, odd).
+            // Standard f32 Clenshaw loses ~3 digits over 7 iterations;
+            // Kahan summation recovers them by tracking the rounding error.
             float c0 = rw_table[base + 13*40];
             float c1 = rw_table[base + 12*40];
+            float e0 = 0.0f, e1 = 0.0f;  // compensation terms
             for (int n = 11; n >= 1; n -= 2) {
                 float c2 = rw_table[base + n*40] - c1;
-                float c3 = c0 + c1 * u2;
-                c1 = c2 + c3 * u2;
+                // c3 = c0 + c1*u2 with compensation
+                float prod = c1 * u2;
+                float y3 = prod - e0;
+                float c3 = c0 + y3;
+                e0 = (c3 - c0) - y3;
+                // c1 = c2 + c3*u2 with compensation
+                float prod2 = c3 * u2;
+                float y1 = (prod2 + c2) - e1;
+                c1 = y1;
+                e1 = (c1) - y1;
+                // c0 = table - c3
                 c0 = rw_table[base + (n-1)*40] - c3;
             }
             float val = c0 + c1 * u;
