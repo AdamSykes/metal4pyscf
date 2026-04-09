@@ -218,6 +218,13 @@ def install_metal_vxc_grad_patch():
     _vxc_grad_patched = True
 
 
+def _max_nroots_ip1(mol, auxmol):
+    """Max Rys quadrature roots needed for int3c2e_ip1 with this basis."""
+    max_l_orb = max(mol.bas_angular(i) for i in range(mol.nbas))
+    max_l_aux = max(auxmol.bas_angular(i) for i in range(auxmol.nbas))
+    return (max_l_orb + 1 + max_l_orb + max_l_aux) // 2 + 1
+
+
 _int3c_patched = False
 
 
@@ -242,7 +249,8 @@ def install_metal_int3c2e_ip1_patch():
         # the CPU is faster and gives f64 precision.
         intor_base = intor.replace('_sph', '').replace('_cart', '').replace('_spinor', '')
         if (intor_base != 'int3c2e_ip1' or aosym != 's1'
-                or mol.nao < 9999):  # f64e works but task builder too slow for large mol
+                or mol.nao < 100
+                or _max_nroots_ip1(mol, auxmol) > 5):  # table accurate for nroots≤5
             return _original_wrapper(mol, auxmol, intor, aosym)
 
         # Load the Metal kernel module (avoid cupy-gated imports)

@@ -82,10 +82,10 @@ _FAC_L = {0: sqrt(1.0 / (4 * pi)),
           1: sqrt(3.0 / (4 * pi)),
           2: 1.0, 3: 1.0, 4: 1.0}
 
-# Task layout for f64-emulated kernel.
-# Each f64 value is stored as 2 floats (hi, lo). Integer fields stay single.
-# Total: 64 floats per primitive triple.
-TASK_STRIDE = 64
+# Task layout (36 floats per primitive triple).
+# f32 inputs with f64-accurate Rys roots (truncated to f32 after Clenshaw).
+# Chebyshev table accurate to 1e-7 for nroots ≤ 5 (threshold=99).
+TASK_STRIDE = 36
 #  [0:2]    aij (f64e: hi, lo)
 #  [2:4]    ak  (f64e: hi, lo)
 #  [4:10]   PA  (3 × f64e: hi,lo pairs)
@@ -200,31 +200,29 @@ _SOURCE_3C = '''
 uint tid = thread_position_in_grid.x;
 if (tid >= n_tasks) return;
 
-// Read f64-emulated inputs (each stored as hi,lo f32 pair)
 int off = tid * TASK_STRIDE;
-f64e aij = f64e_from_pair(task_data[off+0], task_data[off+1]);
-f64e ak  = f64e_from_pair(task_data[off+2], task_data[off+3]);
-f64e PA[3] = {f64e_from_pair(task_data[off+4], task_data[off+5]),
-              f64e_from_pair(task_data[off+6], task_data[off+7]),
-              f64e_from_pair(task_data[off+8], task_data[off+9])};
-f64e PC[3] = {f64e_from_pair(task_data[off+10], task_data[off+11]),
-              f64e_from_pair(task_data[off+12], task_data[off+13]),
-              f64e_from_pair(task_data[off+14], task_data[off+15])};
-f64e AB[3] = {f64e_from_pair(task_data[off+16], task_data[off+17]),
-              f64e_from_pair(task_data[off+18], task_data[off+19]),
-              f64e_from_pair(task_data[off+20], task_data[off+21])};
-f64e prefac = f64e_from_pair(task_data[off+22], task_data[off+23]);
-f64e ai_exp = f64e_from_pair(task_data[off+24], task_data[off+25]);
-int li      = (int)task_data[off+26];
-int lj      = (int)task_data[off+27];
-int lk      = (int)task_data[off+28];
-int nroots  = (int)task_data[off+29];
-f64e rys_r[6], rys_w[6];
-for (int r = 0; r < 6; r++) {
-    rys_r[r] = f64e_from_pair(task_data[off+30+r*2], task_data[off+31+r*2]);
-    rys_w[r] = f64e_from_pair(task_data[off+42+r*2], task_data[off+43+r*2]);
-}
-int out_off = offsets[tid];
+float aij     = task_data[off + 0];
+float ak      = task_data[off + 1];
+float PA_x    = task_data[off + 2];
+float PA_y    = task_data[off + 3];
+float PA_z    = task_data[off + 4];
+float AB_x    = task_data[off + 8];
+float AB_y    = task_data[off + 9];
+float AB_z    = task_data[off + 10];
+float prefac  = task_data[off + 11];
+float ai_exp  = task_data[off + 12];
+int li        = (int)task_data[off + 13];
+int lj        = (int)task_data[off + 14];
+int lk        = (int)task_data[off + 15];
+int out_off   = offsets[tid];
+int nroots    = (int)task_data[off + 17];
+float rys_r[6] = {task_data[off+18], task_data[off+19], task_data[off+20],
+                   task_data[off+21], task_data[off+22], task_data[off+23]};
+float rys_w[6] = {task_data[off+24], task_data[off+25], task_data[off+26],
+                   task_data[off+27], task_data[off+28], task_data[off+29]};
+float Rpq_x   = task_data[off + 30];
+float Rpq_y   = task_data[off + 31];
+float Rpq_z   = task_data[off + 32];
 
 int li1 = li + 1;
 int lij1 = li1 + lj;
@@ -232,78 +230,52 @@ int ni = NCART[li], nj = NCART[lj], nk = NCART[lk];
 int ci_off = CART_OFF[li], cj_off = CART_OFF[lj], ck_off = CART_OFF[lk];
 int comp_stride = ni * nj * nk;
 int n_out = 3 * comp_stride;
+for (int i = 0; i < n_out; i++) int_out[out_off + i] = 0.0f;
 
-// Accumulate across Rys roots in f64e to avoid cancellation.
-// Max output: 3 * 10 * 10 * 5 = 1500 for (ff|d). For (ff|g) = 4500,
-// we'd need 36KB — too much. Limit f64e accum to n_out <= 1500.
-f64e gout_ds[1500];
-bool use_ds_accum = (n_out <= 1500);
-if (use_ds_accum) {
-    for (int i = 0; i < n_out; i++) gout_ds[i] = f64e_from_f32(0.0f);
-} else {
-    for (int i = 0; i < n_out; i++) int_out[out_off + i] = 0.0f;
-}
-
-f64e aijk = f64e_add(aij, ak);
+float PA[3] = {PA_x, PA_y, PA_z};
+float AB[3] = {AB_x, AB_y, AB_z};
+float Rpq[3] = {Rpq_x, Rpq_y, Rpq_z};
+float aijk = aij + ak;
 
 for (int iroot = 0; iroot < nroots; iroot++) {
-    f64e rt = rys_r[iroot];
-    f64e wt = rys_w[iroot];
-    f64e rt_aa  = f64e_div(rt, aijk);
-    f64e rt_aij = f64e_mul(rt_aa, ak);
-    f64e one_half = f64e_from_f32(0.5f);
-    f64e one = f64e_from_f32(1.0f);
-    f64e b10 = f64e_mul(f64e_div(one_half, aij), f64e_sub(one, rt_aij));
-    f64e b01 = f64e_mul(f64e_div(one_half, ak), f64e_sub(one, f64e_mul(rt_aa, aij)));
-    f64e b00 = f64e_mul(one_half, rt_aa);
+    float rt = rys_r[iroot];
+    float wt = rys_w[iroot];
+    float rt_aa  = rt / aijk;
+    float rt_aij = rt_aa * ak;
+    float b10 = 0.5f / aij * (1.0f - rt_aij);
+    float b01 = 0.5f / ak  * (1.0f - rt_aa * aij);
+    float b00 = 0.5f * rt_aa;
 
-    // Per-direction TRR + HRR in full f64e precision
-    f64e g_final[3][9][4][5];
-
+    float g_ij[3][9][4][5];
     for (int dir = 0; dir < 3; dir++) {
-        f64e c0 = f64e_sub(PA[dir], f64e_mul(rt_aij, PC[dir]));
-        f64e cp = f64e_mul(f64e_mul(rt_aa, aij), PC[dir]);
-
-        // TRR
-        f64e g[9][5];
+        float c0 = PA[dir] - rt_aij * Rpq[dir];
+        float cp = (rt_aa * aij) * Rpq[dir];
+        float g[9][5];
         for (int a = 0; a <= lij1; a++)
-            for (int c = 0; c <= lk; c++) g[a][c] = f64e_from_f32(0.0f);
-        g[0][0] = f64e_from_f32(1.0f);
-
+            for (int c = 0; c <= lk; c++) g[a][c] = 0.0f;
+        g[0][0] = 1.0f;
         if (lij1 > 0) g[1][0] = c0;
         for (int a = 1; a < lij1; a++)
-            g[a+1][0] = f64e_add(f64e_mul(c0, g[a][0]),
-                                  f64e_mul_s(float(a), f64e_mul(b10, g[a-1][0])));
-
+            g[a+1][0] = c0 * g[a][0] + float(a) * b10 * g[a-1][0];
         for (int c = 0; c < lk; c++) {
             for (int a = 0; a <= lij1; a++) {
-                f64e val = f64e_mul(cp, g[a][c]);
-                if (c > 0) val = f64e_add(val, f64e_mul_s(float(c), f64e_mul(b01, g[a][c-1])));
-                if (a > 0) val = f64e_add(val, f64e_mul_s(float(a), f64e_mul(b00, g[a-1][c])));
+                float val = cp * g[a][c];
+                if (c > 0) val += float(c) * b01 * g[a][c-1];
+                if (a > 0) val += float(a) * b00 * g[a-1][c];
                 g[a][c+1] = val;
             }
         }
-
-        // HRR
-        f64e g_hrr[9][4][5];
         for (int a = 0; a <= lij1; a++)
-            for (int c = 0; c <= lk; c++) g_hrr[a][0][c] = g[a][c];
+            for (int c = 0; c <= lk; c++)
+                g_ij[dir][a][0][c] = g[a][c];
+        float ab = AB[dir];
         for (int j = 0; j < lj; j++)
             for (int c = 0; c <= lk; c++)
                 for (int i = 0; i <= lij1 - j - 1; i++)
-                    g_hrr[i][j+1][c] = f64e_add(g_hrr[i+1][j][c],
-                                                  f64e_mul(AB[dir], g_hrr[i][j][c]));
-
-        for (int i = 0; i <= li1; i++)
-            for (int j = 0; j <= lj; j++)
-                for (int k = 0; k <= lk; k++)
-                    g_final[dir][i][j][k] = g_hrr[i][j][k];
+                    g_ij[dir][i][j+1][c] = g_ij[dir][i+1][j][c] + ab * g_ij[dir][i][j][c];
     }
 
-    // Contract in f64e, extract f32 at the very end
-    f64e pf_wt = f64e_mul(prefac, wt);
-    f64e two_ai = f64e_mul_s(2.0f, ai_exp);
-
+    float pf_wt = prefac * wt;
     for (int ii = 0; ii < ni; ii++) {
         int ci_v = CART_ALL[ci_off + ii];
         int ix = ci_v / 25, iy = (ci_v / 5) % 5, iz = ci_v % 5;
@@ -313,46 +285,27 @@ for (int iroot = 0; iroot < nroots; iroot++) {
             for (int kk = 0; kk < nk; kk++) {
                 int ck_v = CART_ALL[ck_off + kk];
                 int kx = ck_v / 25, ky = (ck_v / 5) % 5, kz = ck_v % 5;
-
-                f64e vx = g_final[0][ix][jx][kx];
-                f64e vy = g_final[1][iy][jy][ky];
-                f64e vz = g_final[2][iz][jz][kz];
-
-                f64e ddx = f64e_mul(two_ai, g_final[0][ix+1][jx][kx]);
-                if (ix > 0) ddx = f64e_sub(ddx, f64e_mul_s(float(ix), g_final[0][ix-1][jx][kx]));
-                f64e ddy = f64e_mul(two_ai, g_final[1][iy+1][jy][ky]);
-                if (iy > 0) ddy = f64e_sub(ddy, f64e_mul_s(float(iy), g_final[1][iy-1][jy][ky]));
-                f64e ddz = f64e_mul(two_ai, g_final[2][iz+1][jz][kz]);
-                if (iz > 0) ddz = f64e_sub(ddz, f64e_mul_s(float(iz), g_final[2][iz-1][jz][kz]));
-
-                int idx = (ii * nj + jj) * nk + kk;
-                f64e val_x = f64e_mul(pf_wt, f64e_mul(ddx, f64e_mul(vy, vz)));
-                f64e val_y = f64e_mul(pf_wt, f64e_mul(vx, f64e_mul(ddy, vz)));
-                f64e val_z = f64e_mul(pf_wt, f64e_mul(vx, f64e_mul(vy, ddz)));
-                if (use_ds_accum) {
-                    gout_ds[idx]                = f64e_add(gout_ds[idx], val_x);
-                    gout_ds[idx + comp_stride]  = f64e_add(gout_ds[idx + comp_stride], val_y);
-                    gout_ds[idx + 2*comp_stride] = f64e_add(gout_ds[idx + 2*comp_stride], val_z);
-                } else {
-                    int base = out_off + idx;
-                    int_out[base]                  += f64e_to_f32(val_x);
-                    int_out[base + comp_stride]    += f64e_to_f32(val_y);
-                    int_out[base + 2*comp_stride]  += f64e_to_f32(val_z);
-                }
+                float vx = g_ij[0][ix][jx][kx];
+                float vy = g_ij[1][iy][jy][ky];
+                float vz = g_ij[2][iz][jz][kz];
+                float dx = 2.0f * ai_exp * g_ij[0][ix+1][jx][kx];
+                if (ix > 0) dx -= float(ix) * g_ij[0][ix-1][jx][kx];
+                float dy = 2.0f * ai_exp * g_ij[1][iy+1][jy][ky];
+                if (iy > 0) dy -= float(iy) * g_ij[1][iy-1][jy][ky];
+                float dz = 2.0f * ai_exp * g_ij[2][iz+1][jz][kz];
+                if (iz > 0) dz -= float(iz) * g_ij[2][iz-1][jz][kz];
+                int base = out_off + (ii * nj + jj) * nk + kk;
+                int_out[base]                  += pf_wt * dx * vy * vz;
+                int_out[base + comp_stride]    += pf_wt * vx * dy * vz;
+                int_out[base + 2*comp_stride]  += pf_wt * vx * vy * dz;
             }
         }
     }
 } // end root loop
-
-// Write f64e accumulators to f32 output
-if (use_ds_accum) {
-    for (int i = 0; i < n_out; i++)
-        int_out[out_off + i] = f64e_to_f32(gout_ds[i]);
-}
 '''
 
 _int3c2e_ip1_kernel = mx.fast.metal_kernel(
-    name='int3c2e_ip1_f64emul_v4',  # f64e inputs + TRR + output accumulation
+    name='int3c2e_ip1_f32_rysfix',  # f32 TRR + fixed Rys threshold (99)
     input_names=['task_data', 'offsets'],
     output_names=['int_out'],
     header=_HEADER_3C,
@@ -523,34 +476,32 @@ def _build_3c_tasks_nb(
                                           lr, lw, roots_flat, weights_flat,
                                           task_count * 6)
 
-                            # Pack task as f64e (hi, lo) pairs for full f64 emulation
+                            # Pack task (f32, compact TASK_STRIDE=36)
                             tc = task_count
-                            base = tc * 64  # TASK_STRIDE = 64
-                            PAx = px - shell_x[ish]
-                            PAy = py - shell_y[ish]
-                            PAz = pz - shell_z[ish]
-                            # f64 → (f32_hi, f32_lo) split inline
-                            vals = [aij, ak, PAx, PAy, PAz, PCx, PCy, PCz,
-                                    dx, dy, dz, prefac, ai]
-                            for vi in range(13):
-                                v = vals[vi]
-                                hi = np.float32(v)
-                                lo = np.float32(v - float(hi))
-                                tasks[base + vi*2] = float(hi)
-                                tasks[base + vi*2 + 1] = float(lo)
-                            tasks[base + 26] = li
-                            tasks[base + 27] = lj
-                            tasks[base + 28] = lk
-                            tasks[base + 29] = nroots
+                            base = tc * 36
+                            tasks[base + 0] = aij
+                            tasks[base + 1] = ak
+                            tasks[base + 2] = px - shell_x[ish]  # PA
+                            tasks[base + 3] = py - shell_y[ish]
+                            tasks[base + 4] = pz - shell_z[ish]
+                            tasks[base + 5] = PCx
+                            tasks[base + 6] = PCy
+                            tasks[base + 7] = PCz
+                            tasks[base + 8] = dx  # AB
+                            tasks[base + 9] = dy
+                            tasks[base + 10] = dz
+                            tasks[base + 11] = prefac
+                            tasks[base + 12] = ai
+                            tasks[base + 13] = li
+                            tasks[base + 14] = lj
+                            tasks[base + 15] = lk
+                            tasks[base + 17] = nroots
                             for r in range(nroots):
-                                rv = roots_flat[tc * 6 + r]
-                                wv = weights_flat[tc * 6 + r]
-                                hi_r = np.float32(rv); lo_r = np.float32(rv - float(hi_r))
-                                hi_w = np.float32(wv); lo_w = np.float32(wv - float(hi_w))
-                                tasks[base + 30 + r*2] = float(hi_r)
-                                tasks[base + 31 + r*2] = float(lo_r)
-                                tasks[base + 42 + r*2] = float(hi_w)
-                                tasks[base + 43 + r*2] = float(lo_w)
+                                tasks[base + 18 + r] = float(roots_flat[tc * 6 + r])
+                                tasks[base + 24 + r] = float(weights_flat[tc * 6 + r])
+                            tasks[base + 30] = PCx
+                            tasks[base + 31] = PCy
+                            tasks[base + 32] = PCz
 
                             offsets[tc] = out_offset
                             out_offset += n_out
@@ -967,31 +918,18 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
     m_nfk = np.zeros(max_triples, dtype=np.int32)
     m_nout = np.zeros(max_triples, dtype=np.int32)
 
-    # Build f64 exps/coeffs/coords directly from PySCF (NOT from f32 _pack_shell_data).
-    # Critical: f64 inputs → f64e (hi,lo) pairs in task data → full f64 emulation.
-    nbas_total = nbas + auxmol.nbas
-    exps_f64 = np.concatenate([mol.bas_exp(i) for i in range(nbas)] +
-                               [auxmol.bas_exp(i) for i in range(auxmol.nbas)])
-    coeffs_f64 = np.concatenate([mol._libcint_ctr_coeff(i).flatten() for i in range(nbas)] +
-                                 [auxmol._libcint_ctr_coeff(i).flatten() for i in range(auxmol.nbas)])
-    coords_all = np.array([mol.atom_coord(mol.bas_atom(i)) for i in range(nbas)] +
-                           [auxmol.atom_coord(auxmol.bas_atom(i)) for i in range(auxmol.nbas)])
-    sx_f64 = coords_all[:, 0].copy()
-    sy_f64 = coords_all[:, 1].copy()
-    sz_f64 = coords_all[:, 2].copy()
-
     n_tasks, n_meta, total_out = _build_3c_tasks_nb(
         nbas, shl0_aux, shl1_aux,
         sl_arr, snp_arr, spo_arr,
-        exps_f64, coeffs_f64,
-        sx_f64, sy_f64, sz_f64,
+        exps_arr.astype(np.float64), coeffs_arr.astype(np.float64),
+        sx.astype(np.float64), sy.astype(np.float64), sz.astype(np.float64),
         nbas, _NCART_LUT,
         tbl['rw'], tbl['sr0'], tbl['sr1'], tbl['sw0'], tbl['sw1'],
         tbl['lr'], tbl['lw'],
         tasks_flat, roots_flat, weights_flat, offsets_buf,
         m_ish, m_jsh, m_ksh, m_ts, m_tc, m_nfi, m_nfj, m_nfk, m_nout)
 
-    if n_tasks == 0 or total_out == 0:
+    if n_tasks == 0 or total_out == 0 or n_tasks >= max_tasks:
         return _cpu_fallback(mol, auxmol, shls_slice)
 
     tasks = tasks_flat[:n_tasks * TASK_STRIDE].reshape(n_tasks, TASK_STRIDE)
