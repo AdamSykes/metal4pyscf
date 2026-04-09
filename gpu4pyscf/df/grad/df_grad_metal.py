@@ -242,7 +242,7 @@ def install_metal_int3c2e_ip1_patch():
         # the CPU is faster and gives f64 precision.
         intor_base = intor.replace('_sph', '').replace('_cart', '').replace('_spinor', '')
         if (intor_base != 'int3c2e_ip1' or aosym != 's1'
-                or mol.nao < 100):  # f64e TRR + fixed Rys largex threshold
+                or mol.nao < 9999):  # f64e works but task builder too slow for large mol
             return _original_wrapper(mol, auxmol, intor, aosym)
 
         # Load the Metal kernel module (avoid cupy-gated imports)
