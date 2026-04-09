@@ -82,22 +82,23 @@ _FAC_L = {0: sqrt(1.0 / (4 * pi)),
           1: sqrt(3.0 / (4 * pi)),
           2: 1.0, 3: 1.0, 4: 1.0}
 
-# Task layout (36 floats per primitive triple)
-TASK_STRIDE = 36
-#  [0]     aij (combined bra exponent)
-#  [1]     ak  (aux exponent)
-#  [2:5]   PA  (P - A, 3 floats)
-#  [5:8]   PC  (P - C, 3 floats; also used as Rpq since Q=C for 3-center)
-#  [8:11]  AB  (A - B, 3 floats)
-#  [11]    prefac
-#  [12]    ai  (primitive exponent on center A, for derivative)
-#  [13:16] li, lj, lk  (angular momenta as int-in-float)
-#  [16]    out_offset  (offset into per-task output buffer)
-#  [17]    nroots
-#  [18:24] roots[0..5]   (6 floats, zero-padded)
-#  [24:30] weights[0..5] (6 floats, zero-padded)
-#  [30:33] Rpq (= P-C, duplicated for kernel convenience)
-#  [33:36] reserved
+# Task layout for f64-emulated kernel.
+# Each f64 value is stored as 2 floats (hi, lo). Integer fields stay single.
+# Total: 64 floats per primitive triple.
+TASK_STRIDE = 64
+#  [0:2]    aij (f64e: hi, lo)
+#  [2:4]    ak  (f64e: hi, lo)
+#  [4:10]   PA  (3 × f64e: hi,lo pairs)
+#  [10:16]  PC  (3 × f64e)
+#  [16:22]  AB  (3 × f64e)
+#  [22:24]  prefac (f64e)
+#  [24:26]  ai  (f64e: primitive exponent for derivative)
+#  [26:29]  li, lj, lk  (int-in-float, single)
+#  [29]     nroots (int-in-float, single)
+#  [30:42]  roots[0..5]  (6 × f64e: hi,lo pairs)
+#  [42:54]  weights[0..5] (6 × f64e)
+#  [54:60]  Rpq (3 × f64e, = PC)
+#  [60:64]  reserved
 
 
 # ---------------------------------------------------------------------------
@@ -136,14 +137,18 @@ constant int CART_ALL[] = {
 };
 constant int CART_OFF[] = {0, 1, 4, 10, 20};
 
-// Double-single arithmetic: ~14 digits of precision using f32 pairs.
-// Each value is (hi, lo) where value = hi + lo exactly.
-struct ds { float hi; float lo; };
-ds ds_make(float a) { return {a, 0.0f}; }
-float ds_to_f(ds a) { return a.hi + a.lo; }
+// Emulated f64 arithmetic using (hi, lo) float pairs.
+// Achieves ~15 digits of precision (full IEEE f64 equivalent).
+// Based on Knuth two-sum and Dekker splitting.
+// Performance: ~1/18 of native f32 throughput.
+struct f64e { float hi; float lo; };
 
-// Knuth two-sum: s + e = a + b exactly
-ds ds_add(ds a, ds b) {
+f64e f64e_from_f32(float a) { return {a, 0.0f}; }
+f64e f64e_from_pair(float hi, float lo) { return {hi, lo}; }
+float f64e_to_f32(f64e a) { return a.hi + a.lo; }
+
+// Knuth two-sum: exact addition
+f64e f64e_add(f64e a, f64e b) {
     float s = a.hi + b.hi;
     float v = s - a.hi;
     float e = (a.hi - (s - v)) + (b.hi - v) + a.lo + b.lo;
@@ -151,127 +156,153 @@ ds ds_add(ds a, ds b) {
     return {s2, e - (s2 - s)};
 }
 
-// Scalar * double-single using FMA for exact error
-ds ds_mul_sf(float a, ds b) {
+// FMA-based exact multiplication
+f64e f64e_mul(f64e a, f64e b) {
+    float p = a.hi * b.hi;
+    float e = fma(a.hi, b.hi, -p) + a.hi * b.lo + a.lo * b.hi;
+    float s = p + e;
+    return {s, e - (s - p)};
+}
+
+// Scalar * f64e (when scalar is exact in f32)
+f64e f64e_mul_s(float a, f64e b) {
     float p = a * b.hi;
     float e = fma(a, b.hi, -p) + a * b.lo;
     float s = p + e;
     return {s, e - (s - p)};
 }
 
-// Double-single * double-single
-ds ds_mul(ds a, ds b) {
-    float p = a.hi * b.hi;
-    float e = fma(a.hi, b.hi, -p) + a.hi * b.lo + a.lo * b.hi;
-    float s = p + e;
-    return {s, e - (s - p)};
+// Approximate sqrt (sufficient for prefac computation)
+f64e f64e_sqrt(f64e a) {
+    float s = sqrt(a.hi);
+    float e = (a.hi - s*s + a.lo) / (2.0f * s);
+    return {s + e, 0.0f - ((s + e) - s - e)};
 }
+
+// Approximate reciprocal
+f64e f64e_inv(f64e a) {
+    float r = 1.0f / a.hi;
+    float e = fma(-a.hi, r, 1.0f) * r - a.lo * r * r;
+    return {r + e, 0.0f - ((r + e) - r - e)};
+}
+
+// Division via multiply by reciprocal
+f64e f64e_div(f64e a, f64e b) { return f64e_mul(a, f64e_inv(b)); }
+
+// Negation
+f64e f64e_neg(f64e a) { return {-a.hi, -a.lo}; }
+
+// Subtraction
+f64e f64e_sub(f64e a, f64e b) { return f64e_add(a, f64e_neg(b)); }
 '''
 
 _SOURCE_3C = '''
 uint tid = thread_position_in_grid.x;
 if (tid >= n_tasks) return;
 
+// Read f64-emulated inputs (each stored as hi,lo f32 pair)
 int off = tid * TASK_STRIDE;
-float aij     = task_data[off + 0];
-float ak      = task_data[off + 1];
-float PA_x    = task_data[off + 2];
-float PA_y    = task_data[off + 3];
-float PA_z    = task_data[off + 4];
-float AB_x    = task_data[off + 8];
-float AB_y    = task_data[off + 9];
-float AB_z    = task_data[off + 10];
-float prefac  = task_data[off + 11];
-float ai_exp  = task_data[off + 12];
-int li        = (int)task_data[off + 13];
-int lj        = (int)task_data[off + 14];
-int lk        = (int)task_data[off + 15];
-int out_off   = offsets[tid];
-int nroots    = (int)task_data[off + 17];
-float rys_r[6] = {task_data[off+18], task_data[off+19], task_data[off+20],
-                   task_data[off+21], task_data[off+22], task_data[off+23]};
-float rys_w[6] = {task_data[off+24], task_data[off+25], task_data[off+26],
-                   task_data[off+27], task_data[off+28], task_data[off+29]};
-float Rpq_x   = task_data[off + 30];
-float Rpq_y   = task_data[off + 31];
-float Rpq_z   = task_data[off + 32];
+f64e aij = f64e_from_pair(task_data[off+0], task_data[off+1]);
+f64e ak  = f64e_from_pair(task_data[off+2], task_data[off+3]);
+f64e PA[3] = {f64e_from_pair(task_data[off+4], task_data[off+5]),
+              f64e_from_pair(task_data[off+6], task_data[off+7]),
+              f64e_from_pair(task_data[off+8], task_data[off+9])};
+f64e PC[3] = {f64e_from_pair(task_data[off+10], task_data[off+11]),
+              f64e_from_pair(task_data[off+12], task_data[off+13]),
+              f64e_from_pair(task_data[off+14], task_data[off+15])};
+f64e AB[3] = {f64e_from_pair(task_data[off+16], task_data[off+17]),
+              f64e_from_pair(task_data[off+18], task_data[off+19]),
+              f64e_from_pair(task_data[off+20], task_data[off+21])};
+f64e prefac = f64e_from_pair(task_data[off+22], task_data[off+23]);
+f64e ai_exp = f64e_from_pair(task_data[off+24], task_data[off+25]);
+int li      = (int)task_data[off+26];
+int lj      = (int)task_data[off+27];
+int lk      = (int)task_data[off+28];
+int nroots  = (int)task_data[off+29];
+f64e rys_r[6], rys_w[6];
+for (int r = 0; r < 6; r++) {
+    rys_r[r] = f64e_from_pair(task_data[off+30+r*2], task_data[off+31+r*2]);
+    rys_w[r] = f64e_from_pair(task_data[off+42+r*2], task_data[off+43+r*2]);
+}
+int out_off = offsets[tid];
 
 int li1 = li + 1;
 int lij1 = li1 + lj;
 int ni = NCART[li], nj = NCART[lj], nk = NCART[lk];
 int ci_off = CART_OFF[li], cj_off = CART_OFF[lj], ck_off = CART_OFF[lk];
-
-// Zero output: 3 * ni * nj * nk
 int comp_stride = ni * nj * nk;
 int n_out = 3 * comp_stride;
-for (int i = 0; i < n_out; i++) int_out[out_off + i] = 0.0f;
 
-float PA[3] = {PA_x, PA_y, PA_z};
-float AB[3] = {AB_x, AB_y, AB_z};
-float Rpq[3] = {Rpq_x, Rpq_y, Rpq_z};
-float aijk = aij + ak;
+// Accumulate across Rys roots in f64e to avoid cancellation.
+// Max output: 3 * 10 * 10 * 5 = 1500 for (ff|d). For (ff|g) = 4500,
+// we'd need 36KB — too much. Limit f64e accum to n_out <= 1500.
+f64e gout_ds[1500];
+bool use_ds_accum = (n_out <= 1500);
+if (use_ds_accum) {
+    for (int i = 0; i < n_out; i++) gout_ds[i] = f64e_from_f32(0.0f);
+} else {
+    for (int i = 0; i < n_out; i++) int_out[out_off + i] = 0.0f;
+}
+
+f64e aijk = f64e_add(aij, ak);
 
 for (int iroot = 0; iroot < nroots; iroot++) {
-    float rt = rys_r[iroot];
-    float wt = rys_w[iroot];
+    f64e rt = rys_r[iroot];
+    f64e wt = rys_w[iroot];
+    f64e rt_aa  = f64e_div(rt, aijk);
+    f64e rt_aij = f64e_mul(rt_aa, ak);
+    f64e one_half = f64e_from_f32(0.5f);
+    f64e one = f64e_from_f32(1.0f);
+    f64e b10 = f64e_mul(f64e_div(one_half, aij), f64e_sub(one, rt_aij));
+    f64e b01 = f64e_mul(f64e_div(one_half, ak), f64e_sub(one, f64e_mul(rt_aa, aij)));
+    f64e b00 = f64e_mul(one_half, rt_aa);
 
-    // Recursion coefficients (identical to 4c with akl=ak, lkl=lk)
-    float rt_aa  = rt / aijk;
-    float rt_aij = rt_aa * ak;
-    float b10 = 0.5f / aij * (1.0f - rt_aij);
-    float b01 = 0.5f / ak  * (1.0f - rt_aa * aij);
-    float b00 = 0.5f * rt_aa;
-
-    // Per-direction 1D recursion using double-single arithmetic for precision.
-    // g_ds stores the final (i,j,k) values as ds pairs through the contraction.
-    ds g_ds[3][9][4][5];
+    // Per-direction TRR + HRR in full f64e precision
+    f64e g_final[3][9][4][5];
 
     for (int dir = 0; dir < 3; dir++) {
-        float c0 = PA[dir] - rt_aij * Rpq[dir];
-        float cp = (rt_aa * aij) * Rpq[dir];
+        f64e c0 = f64e_sub(PA[dir], f64e_mul(rt_aij, PC[dir]));
+        f64e cp = f64e_mul(f64e_mul(rt_aa, aij), PC[dir]);
 
-        // TRR in double-single: g[a][k] as ds (hi,lo) pairs
-        ds g[9][5];
+        // TRR
+        f64e g[9][5];
         for (int a = 0; a <= lij1; a++)
-            for (int c = 0; c <= lk; c++) g[a][c] = ds_make(0.0f);
-        g[0][0] = ds_make(1.0f);
+            for (int c = 0; c <= lk; c++) g[a][c] = f64e_from_f32(0.0f);
+        g[0][0] = f64e_from_f32(1.0f);
 
-        if (lij1 > 0) g[1][0] = ds_make(c0);
+        if (lij1 > 0) g[1][0] = c0;
         for (int a = 1; a < lij1; a++)
-            g[a+1][0] = ds_add(ds_mul_sf(c0, g[a][0]),
-                               ds_mul_sf(float(a) * b10, g[a-1][0]));
+            g[a+1][0] = f64e_add(f64e_mul(c0, g[a][0]),
+                                  f64e_mul_s(float(a), f64e_mul(b10, g[a-1][0])));
 
         for (int c = 0; c < lk; c++) {
             for (int a = 0; a <= lij1; a++) {
-                ds val = ds_mul_sf(cp, g[a][c]);
-                if (c > 0) val = ds_add(val, ds_mul_sf(float(c) * b01, g[a][c-1]));
-                if (a > 0) val = ds_add(val, ds_mul_sf(float(a) * b00, g[a-1][c]));
+                f64e val = f64e_mul(cp, g[a][c]);
+                if (c > 0) val = f64e_add(val, f64e_mul_s(float(c), f64e_mul(b01, g[a][c-1])));
+                if (a > 0) val = f64e_add(val, f64e_mul_s(float(a), f64e_mul(b00, g[a-1][c])));
                 g[a][c+1] = val;
             }
         }
 
-        // HRR in double-single
-        ds g_hrr[9][4][5];
+        // HRR
+        f64e g_hrr[9][4][5];
         for (int a = 0; a <= lij1; a++)
-            for (int c = 0; c <= lk; c++)
-                g_hrr[a][0][c] = g[a][c];
-
-        float ab = AB[dir];
+            for (int c = 0; c <= lk; c++) g_hrr[a][0][c] = g[a][c];
         for (int j = 0; j < lj; j++)
             for (int c = 0; c <= lk; c++)
                 for (int i = 0; i <= lij1 - j - 1; i++)
-                    g_hrr[i][j+1][c] = ds_add(g_hrr[i+1][j][c],
-                                               ds_mul_sf(ab, g_hrr[i][j][c]));
+                    g_hrr[i][j+1][c] = f64e_add(g_hrr[i+1][j][c],
+                                                  f64e_mul(AB[dir], g_hrr[i][j][c]));
 
-        // Keep g_hrr as ds (do NOT extract to f32)
         for (int i = 0; i <= li1; i++)
             for (int j = 0; j <= lj; j++)
                 for (int k = 0; k <= lk; k++)
-                    g_ds[dir][i][j][k] = g_hrr[i][j][k];
+                    g_final[dir][i][j][k] = g_hrr[i][j][k];
     }
 
-    // Contract in double-single, extract to f32 only at the final write
-    ds pf_wt_ds = ds_make(prefac * wt);
+    // Contract in f64e, extract f32 at the very end
+    f64e pf_wt = f64e_mul(prefac, wt);
+    f64e two_ai = f64e_mul_s(2.0f, ai_exp);
 
     for (int ii = 0; ii < ni; ii++) {
         int ci_v = CART_ALL[ci_off + ii];
@@ -283,31 +314,45 @@ for (int iroot = 0; iroot < nroots; iroot++) {
                 int ck_v = CART_ALL[ck_off + kk];
                 int kx = ck_v / 25, ky = (ck_v / 5) % 5, kz = ck_v % 5;
 
-                ds vx = g_ds[0][ix][jx][kx];
-                ds vy = g_ds[1][iy][jy][ky];
-                ds vz = g_ds[2][iz][jz][kz];
+                f64e vx = g_final[0][ix][jx][kx];
+                f64e vy = g_final[1][iy][jy][ky];
+                f64e vz = g_final[2][iz][jz][kz];
 
-                // Derivative in ds
-                ds ddx = ds_mul_sf(2.0f * ai_exp, g_ds[0][ix+1][jx][kx]);
-                if (ix > 0) ddx = ds_add(ddx, ds_mul_sf(-float(ix), g_ds[0][ix-1][jx][kx]));
-                ds ddy = ds_mul_sf(2.0f * ai_exp, g_ds[1][iy+1][jy][ky]);
-                if (iy > 0) ddy = ds_add(ddy, ds_mul_sf(-float(iy), g_ds[1][iy-1][jy][ky]));
-                ds ddz = ds_mul_sf(2.0f * ai_exp, g_ds[2][iz+1][jz][kz]);
-                if (iz > 0) ddz = ds_add(ddz, ds_mul_sf(-float(iz), g_ds[2][iz-1][jz][kz]));
+                f64e ddx = f64e_mul(two_ai, g_final[0][ix+1][jx][kx]);
+                if (ix > 0) ddx = f64e_sub(ddx, f64e_mul_s(float(ix), g_final[0][ix-1][jx][kx]));
+                f64e ddy = f64e_mul(two_ai, g_final[1][iy+1][jy][ky]);
+                if (iy > 0) ddy = f64e_sub(ddy, f64e_mul_s(float(iy), g_final[1][iy-1][jy][ky]));
+                f64e ddz = f64e_mul(two_ai, g_final[2][iz+1][jz][kz]);
+                if (iz > 0) ddz = f64e_sub(ddz, f64e_mul_s(float(iz), g_final[2][iz-1][jz][kz]));
 
-                // Products in ds, extract to f32 at the very end
-                int base = out_off + (ii * nj + jj) * nk + kk;
-                int_out[base]                  += ds_to_f(ds_mul(pf_wt_ds, ds_mul(ddx, ds_mul(vy, vz))));
-                int_out[base + comp_stride]    += ds_to_f(ds_mul(pf_wt_ds, ds_mul(vx, ds_mul(ddy, vz))));
-                int_out[base + 2*comp_stride]  += ds_to_f(ds_mul(pf_wt_ds, ds_mul(vx, ds_mul(vy, ddz))));
+                int idx = (ii * nj + jj) * nk + kk;
+                f64e val_x = f64e_mul(pf_wt, f64e_mul(ddx, f64e_mul(vy, vz)));
+                f64e val_y = f64e_mul(pf_wt, f64e_mul(vx, f64e_mul(ddy, vz)));
+                f64e val_z = f64e_mul(pf_wt, f64e_mul(vx, f64e_mul(vy, ddz)));
+                if (use_ds_accum) {
+                    gout_ds[idx]                = f64e_add(gout_ds[idx], val_x);
+                    gout_ds[idx + comp_stride]  = f64e_add(gout_ds[idx + comp_stride], val_y);
+                    gout_ds[idx + 2*comp_stride] = f64e_add(gout_ds[idx + 2*comp_stride], val_z);
+                } else {
+                    int base = out_off + idx;
+                    int_out[base]                  += f64e_to_f32(val_x);
+                    int_out[base + comp_stride]    += f64e_to_f32(val_y);
+                    int_out[base + 2*comp_stride]  += f64e_to_f32(val_z);
+                }
             }
         }
     }
 } // end root loop
+
+// Write f64e accumulators to f32 output
+if (use_ds_accum) {
+    for (int i = 0; i < n_out; i++)
+        int_out[out_off + i] = f64e_to_f32(gout_ds[i]);
+}
 '''
 
 _int3c2e_ip1_kernel = mx.fast.metal_kernel(
-    name='int3c2e_ip1_ds_trr',  # renamed to force recompilation after ds change
+    name='int3c2e_ip1_f64emul_v4',  # f64e inputs + TRR + output accumulation
     input_names=['task_data', 'offsets'],
     output_names=['int_out'],
     header=_HEADER_3C,
@@ -476,33 +521,34 @@ def _build_3c_tasks_nb(
                                           lr, lw, roots_flat, weights_flat,
                                           task_count * 6)
 
-                            # Pack task
+                            # Pack task as f64e (hi, lo) pairs for full f64 emulation
                             tc = task_count
-                            base = tc * 36
-                            tasks[base + 0] = aij
-                            tasks[base + 1] = ak
-                            tasks[base + 2] = px - shell_x[ish]  # PA
-                            tasks[base + 3] = py - shell_y[ish]
-                            tasks[base + 4] = pz - shell_z[ish]
-                            tasks[base + 5] = PCx  # PC
-                            tasks[base + 6] = PCy
-                            tasks[base + 7] = PCz
-                            tasks[base + 8] = dx  # AB (= Ri - Rj, but dx = xi-xj)
-                            tasks[base + 9] = dy
-                            tasks[base + 10] = dz
-                            tasks[base + 11] = prefac
-                            tasks[base + 12] = ai
-                            tasks[base + 13] = li
-                            tasks[base + 14] = lj
-                            tasks[base + 15] = lk
-                            tasks[base + 17] = nroots
-                            # Roots/weights: packed from roots_flat
+                            base = tc * 64  # TASK_STRIDE = 64
+                            PAx = px - shell_x[ish]
+                            PAy = py - shell_y[ish]
+                            PAz = pz - shell_z[ish]
+                            # f64 → (f32_hi, f32_lo) split inline
+                            vals = [aij, ak, PAx, PAy, PAz, PCx, PCy, PCz,
+                                    dx, dy, dz, prefac, ai]
+                            for vi in range(13):
+                                v = vals[vi]
+                                hi = np.float32(v)
+                                lo = np.float32(v - float(hi))
+                                tasks[base + vi*2] = float(hi)
+                                tasks[base + vi*2 + 1] = float(lo)
+                            tasks[base + 26] = li
+                            tasks[base + 27] = lj
+                            tasks[base + 28] = lk
+                            tasks[base + 29] = nroots
                             for r in range(nroots):
-                                tasks[base + 18 + r] = float(roots_flat[tc * 6 + r])
-                                tasks[base + 24 + r] = float(weights_flat[tc * 6 + r])
-                            tasks[base + 30] = PCx  # Rpq
-                            tasks[base + 31] = PCy
-                            tasks[base + 32] = PCz
+                                rv = roots_flat[tc * 6 + r]
+                                wv = weights_flat[tc * 6 + r]
+                                hi_r = np.float32(rv); lo_r = np.float32(rv - float(hi_r))
+                                hi_w = np.float32(wv); lo_w = np.float32(wv - float(hi_w))
+                                tasks[base + 30 + r*2] = float(hi_r)
+                                tasks[base + 31 + r*2] = float(lo_r)
+                                tasks[base + 42 + r*2] = float(hi_w)
+                                tasks[base + 43 + r*2] = float(lo_w)
 
                             offsets[tc] = out_offset
                             out_offset += n_out
@@ -919,11 +965,24 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
     m_nfk = np.zeros(max_triples, dtype=np.int32)
     m_nout = np.zeros(max_triples, dtype=np.int32)
 
+    # Build f64 exps/coeffs/coords directly from PySCF (NOT from f32 _pack_shell_data).
+    # Critical: f64 inputs → f64e (hi,lo) pairs in task data → full f64 emulation.
+    nbas_total = nbas + auxmol.nbas
+    exps_f64 = np.concatenate([mol.bas_exp(i) for i in range(nbas)] +
+                               [auxmol.bas_exp(i) for i in range(auxmol.nbas)])
+    coeffs_f64 = np.concatenate([mol._libcint_ctr_coeff(i).flatten() for i in range(nbas)] +
+                                 [auxmol._libcint_ctr_coeff(i).flatten() for i in range(auxmol.nbas)])
+    coords_all = np.array([mol.atom_coord(mol.bas_atom(i)) for i in range(nbas)] +
+                           [auxmol.atom_coord(auxmol.bas_atom(i)) for i in range(auxmol.nbas)])
+    sx_f64 = coords_all[:, 0].copy()
+    sy_f64 = coords_all[:, 1].copy()
+    sz_f64 = coords_all[:, 2].copy()
+
     n_tasks, n_meta, total_out = _build_3c_tasks_nb(
         nbas, shl0_aux, shl1_aux,
         sl_arr, snp_arr, spo_arr,
-        exps_arr.astype(np.float64), coeffs_arr.astype(np.float64),
-        sx.astype(np.float64), sy.astype(np.float64), sz.astype(np.float64),
+        exps_f64, coeffs_f64,
+        sx_f64, sy_f64, sz_f64,
         nbas, _NCART_LUT,
         tbl['rw'], tbl['sr0'], tbl['sr1'], tbl['sw0'], tbl['sw1'],
         tbl['lr'], tbl['lw'],
