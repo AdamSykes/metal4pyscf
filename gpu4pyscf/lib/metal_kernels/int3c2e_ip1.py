@@ -419,7 +419,9 @@ def _clenshaw_rys(T, nroots, rw, sr0, sr1, sw0, sw1, lr, lw, roots, weights, bas
             s = nroots * (nroots - 1) // 2 + r
             roots[base_idx + r] = sr0[s] + sr1[s] * T
             weights[base_idx + r] = sw0[s] + sw1[s] * T
-    elif T > 35.0 + 5.0 * nroots:
+    elif T > 99.0:
+        # Asymptotic only for T beyond Chebyshev table range [0, 100).
+        # The original threshold (35+5*nroots) caused ~1% weight errors.
         ix = 1.0 / T
         sqix = np.sqrt(ix)
         for r in range(nroots):
