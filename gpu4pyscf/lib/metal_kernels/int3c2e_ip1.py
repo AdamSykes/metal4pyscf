@@ -135,6 +135,37 @@ constant int CART_ALL[] = {
 ''' + ','.join(str(v) for v in _CART_ALL_TBL) + '''
 };
 constant int CART_OFF[] = {0, 1, 4, 10, 20};
+
+// Double-single arithmetic: ~14 digits of precision using f32 pairs.
+// Each value is (hi, lo) where value = hi + lo exactly.
+struct ds { float hi; float lo; };
+ds ds_make(float a) { return {a, 0.0f}; }
+float ds_to_f(ds a) { return a.hi + a.lo; }
+
+// Knuth two-sum: s + e = a + b exactly
+ds ds_add(ds a, ds b) {
+    float s = a.hi + b.hi;
+    float v = s - a.hi;
+    float e = (a.hi - (s - v)) + (b.hi - v) + a.lo + b.lo;
+    float s2 = s + e;
+    return {s2, e - (s2 - s)};
+}
+
+// Scalar * double-single using FMA for exact error
+ds ds_mul_sf(float a, ds b) {
+    float p = a * b.hi;
+    float e = fma(a, b.hi, -p) + a * b.lo;
+    float s = p + e;
+    return {s, e - (s - p)};
+}
+
+// Double-single * double-single
+ds ds_mul(ds a, ds b) {
+    float p = a.hi * b.hi;
+    float e = fma(a.hi, b.hi, -p) + a.hi * b.lo + a.lo * b.hi;
+    float s = p + e;
+    return {s, e - (s - p)};
+}
 '''
 
 _SOURCE_3C = '''
@@ -191,50 +222,56 @@ for (int iroot = 0; iroot < nroots; iroot++) {
     float b01 = 0.5f / ak  * (1.0f - rt_aa * aij);
     float b00 = 0.5f * rt_aa;
 
-    // Per-direction 1D recursion arrays
-    // g_ij[a][j][k]: a=0..lij1(8), j=0..lj(3), k=0..lk(4) → max 9*4*5=180
-    float g_ij[3][9][4][5];
+    // Per-direction 1D recursion using double-single arithmetic for precision.
+    // g_ds stores the final (i,j,k) values as ds pairs through the contraction.
+    ds g_ds[3][9][4][5];
 
     for (int dir = 0; dir < 3; dir++) {
-        float c0 = PA[dir] - rt_aij * Rpq[dir];       // bra TRR center
-        float cp = (rt_aa * aij) * Rpq[dir];            // ket TRR center (QC=0)
+        float c0 = PA[dir] - rt_aij * Rpq[dir];
+        float cp = (rt_aa * aij) * Rpq[dir];
 
-        // TRR: build g[a][k] for a=0..lij1, k=0..lk
-        float g[9][5];
+        // TRR in double-single: g[a][k] as ds (hi,lo) pairs
+        ds g[9][5];
         for (int a = 0; a <= lij1; a++)
-            for (int c = 0; c <= lk; c++) g[a][c] = 0.0f;
-        g[0][0] = 1.0f;
+            for (int c = 0; c <= lk; c++) g[a][c] = ds_make(0.0f);
+        g[0][0] = ds_make(1.0f);
 
-        // Grow bra at k=0
-        if (lij1 > 0) g[1][0] = c0;
+        if (lij1 > 0) g[1][0] = ds_make(c0);
         for (int a = 1; a < lij1; a++)
-            g[a+1][0] = c0 * g[a][0] + float(a) * b10 * g[a-1][0];
+            g[a+1][0] = ds_add(ds_mul_sf(c0, g[a][0]),
+                               ds_mul_sf(float(a) * b10, g[a-1][0]));
 
-        // Grow ket with bra coupling
         for (int c = 0; c < lk; c++) {
             for (int a = 0; a <= lij1; a++) {
-                float val = cp * g[a][c];
-                if (c > 0) val += float(c) * b01 * g[a][c-1];
-                if (a > 0) val += float(a) * b00 * g[a-1][c];
+                ds val = ds_mul_sf(cp, g[a][c]);
+                if (c > 0) val = ds_add(val, ds_mul_sf(float(c) * b01, g[a][c-1]));
+                if (a > 0) val = ds_add(val, ds_mul_sf(float(a) * b00, g[a-1][c]));
                 g[a][c+1] = val;
             }
         }
 
-        // HRR: g_ij[a][0][k] = g[a][k], then
-        //   g_ij[i][j+1][k] = g_ij[i+1][j][k] + AB[dir] * g_ij[i][j][k]
+        // HRR in double-single
+        ds g_hrr[9][4][5];
         for (int a = 0; a <= lij1; a++)
             for (int c = 0; c <= lk; c++)
-                g_ij[dir][a][0][c] = g[a][c];
+                g_hrr[a][0][c] = g[a][c];
 
         float ab = AB[dir];
         for (int j = 0; j < lj; j++)
             for (int c = 0; c <= lk; c++)
                 for (int i = 0; i <= lij1 - j - 1; i++)
-                    g_ij[dir][i][j+1][c] = g_ij[dir][i+1][j][c] + ab * g_ij[dir][i][j][c];
+                    g_hrr[i][j+1][c] = ds_add(g_hrr[i+1][j][c],
+                                               ds_mul_sf(ab, g_hrr[i][j][c]));
+
+        // Keep g_hrr as ds (do NOT extract to f32)
+        for (int i = 0; i <= li1; i++)
+            for (int j = 0; j <= lj; j++)
+                for (int k = 0; k <= lk; k++)
+                    g_ds[dir][i][j][k] = g_hrr[i][j][k];
     }
 
-    // Contract over this root with derivative application
-    float pf_wt = prefac * wt;
+    // Contract in double-single, extract to f32 only at the final write
+    ds pf_wt_ds = ds_make(prefac * wt);
 
     for (int ii = 0; ii < ni; ii++) {
         int ci_v = CART_ALL[ci_off + ii];
@@ -246,24 +283,23 @@ for (int iroot = 0; iroot < nroots; iroot++) {
                 int ck_v = CART_ALL[ck_off + kk];
                 int kx = ck_v / 25, ky = (ck_v / 5) % 5, kz = ck_v % 5;
 
-                float vx = g_ij[0][ix][jx][kx];
-                float vy = g_ij[1][iy][jy][ky];
-                float vz = g_ij[2][iz][jz][kz];
+                ds vx = g_ds[0][ix][jx][kx];
+                ds vy = g_ds[1][iy][jy][ky];
+                ds vz = g_ds[2][iz][jz][kz];
 
-                // d/dA_x: 2*ai * g[ix+1,jx,kx] - ix * g[ix-1,jx,kx]
-                float dx = 2.0f * ai_exp * g_ij[0][ix+1][jx][kx];
-                if (ix > 0) dx -= float(ix) * g_ij[0][ix-1][jx][kx];
+                // Derivative in ds
+                ds ddx = ds_mul_sf(2.0f * ai_exp, g_ds[0][ix+1][jx][kx]);
+                if (ix > 0) ddx = ds_add(ddx, ds_mul_sf(-float(ix), g_ds[0][ix-1][jx][kx]));
+                ds ddy = ds_mul_sf(2.0f * ai_exp, g_ds[1][iy+1][jy][ky]);
+                if (iy > 0) ddy = ds_add(ddy, ds_mul_sf(-float(iy), g_ds[1][iy-1][jy][ky]));
+                ds ddz = ds_mul_sf(2.0f * ai_exp, g_ds[2][iz+1][jz][kz]);
+                if (iz > 0) ddz = ds_add(ddz, ds_mul_sf(-float(iz), g_ds[2][iz-1][jz][kz]));
 
-                float dy = 2.0f * ai_exp * g_ij[1][iy+1][jy][ky];
-                if (iy > 0) dy -= float(iy) * g_ij[1][iy-1][jy][ky];
-
-                float dz = 2.0f * ai_exp * g_ij[2][iz+1][jz][kz];
-                if (iz > 0) dz -= float(iz) * g_ij[2][iz-1][jz][kz];
-
+                // Products in ds, extract to f32 at the very end
                 int base = out_off + (ii * nj + jj) * nk + kk;
-                int_out[base]                  += pf_wt * dx * vy * vz;
-                int_out[base + comp_stride]    += pf_wt * vx * dy * vz;
-                int_out[base + 2*comp_stride]  += pf_wt * vx * vy * dz;
+                int_out[base]                  += ds_to_f(ds_mul(pf_wt_ds, ds_mul(ddx, ds_mul(vy, vz))));
+                int_out[base + comp_stride]    += ds_to_f(ds_mul(pf_wt_ds, ds_mul(vx, ds_mul(ddy, vz))));
+                int_out[base + 2*comp_stride]  += ds_to_f(ds_mul(pf_wt_ds, ds_mul(vx, ds_mul(vy, ddz))));
             }
         }
     }
@@ -271,7 +307,7 @@ for (int iroot = 0; iroot < nroots; iroot++) {
 '''
 
 _int3c2e_ip1_kernel = mx.fast.metal_kernel(
-    name='int3c2e_ip1_trr',
+    name='int3c2e_ip1_ds_trr',  # renamed to force recompilation after ds change
     input_names=['task_data', 'offsets'],
     output_names=['int_out'],
     header=_HEADER_3C,

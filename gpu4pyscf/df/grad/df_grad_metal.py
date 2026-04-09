@@ -242,7 +242,7 @@ def install_metal_int3c2e_ip1_patch():
         # the CPU is faster and gives f64 precision.
         intor_base = intor.replace('_sph', '').replace('_cart', '').replace('_spinor', '')
         if (intor_base != 'int3c2e_ip1' or aosym != 's1'
-                or mol.nao < 9999):  # f32 TRR gives 0.1 grad error; needs f64 GPU
+                or mol.nao < 9999):  # ds TRR doesn't help; error from f32 coefficients
             return _original_wrapper(mol, auxmol, intor, aosym)
 
         # Load the Metal kernel module (avoid cupy-gated imports)
