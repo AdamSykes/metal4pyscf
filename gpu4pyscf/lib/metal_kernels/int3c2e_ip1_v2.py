@@ -283,99 +283,106 @@ _kernel_v2 = mx.fast.metal_kernel(
 # Python dispatch (minimal — just enumerate shell triples + pack data)
 # ---------------------------------------------------------------------------
 
-@nb.njit
-def _clenshaw_rys_batch(T_arr, nroots_arr, rw_table, sx_r0, sx_r1,
-                         sx_w0, sx_w1, lx_r, lx_w, roots_out, weights_out):
-    """Numba-JIT: Clenshaw Rys for a flat array of (T, nroots) pairs."""
-    n = len(T_arr)
-    for i in range(n):
-        T = T_arr[i]
-        nroots = nroots_arr[i]
-        if T < 3e-7:
-            for r in range(nroots):
-                sidx = nroots * (nroots - 1) // 2 + r
-                roots_out[i * 6 + r] = float(sx_r0[sidx] + sx_r1[sidx] * T)
-                weights_out[i * 6 + r] = float(sx_w0[sidx] + sx_w1[sidx] * T)
-        elif T > 35.0 + 5.0 * nroots:
-            inv_x = 1.0 / T
-            sqrt_inv = np.sqrt(inv_x)
-            for r in range(nroots):
-                sidx = nroots * (nroots - 1) // 2 + r
-                roots_out[i * 6 + r] = float(lx_r[sidx] * inv_x)
-                weights_out[i * 6 + r] = float(lx_w[sidx] * sqrt_inv)
-        else:
-            it = min(int(T * 0.4), 39)
-            u = (T - it * 2.5) * 0.8 - 1.0
-            u2 = 2.0 * u
-            nroots_off = 560 * nroots * (nroots - 1)
-            for r in range(nroots):
-                for rw in range(2):
-                    base = nroots_off + (2 * r + rw) * 560 + it
-                    c0 = rw_table[base + 520]  # 13*40
-                    c1 = rw_table[base + 480]  # 12*40
-                    c2_ = 0.0; c3_ = 0.0
-                    for nn in range(11, 0, -2):
-                        c2_ = rw_table[base + nn * 40] - c1
-                        c3_ = c0 + c1 * u2
-                        c1 = c2_ + c3_ * u2
-                        c0 = rw_table[base + (nn - 1) * 40] - c3_
-                    val = c0 + c1 * u
-                    if rw == 0:
-                        roots_out[i * 6 + r] = float(val)
-                    else:
-                        weights_out[i * 6 + r] = float(val)
+@nb.njit(cache=True)
+def _clenshaw_rys_one(T, nroots, base_idx,
+                     rw, sr0, sr1, sw0, sw1, lr, lw,
+                     roots_out, weights_out):
+    """f64 Clenshaw Rys for one primitive, written as f32 at base_idx.
+
+    Mirrors v1's _clenshaw_rys (int3c2e_ip1.py:367) including the
+    corrected T > 99.0 large-x threshold.
+    """
+    if T < 3e-7:
+        for r in range(nroots):
+            s = nroots * (nroots - 1) // 2 + r
+            roots_out[base_idx + r] = np.float32(sr0[s] + sr1[s] * T)
+            weights_out[base_idx + r] = np.float32(sw0[s] + sw1[s] * T)
+    elif T > 99.0:
+        ix = 1.0 / T
+        sqix = np.sqrt(ix)
+        for r in range(nroots):
+            s = nroots * (nroots - 1) // 2 + r
+            roots_out[base_idx + r] = np.float32(lr[s] * ix)
+            weights_out[base_idx + r] = np.float32(lw[s] * sqix)
+    else:
+        it = min(int(T * 0.4), 39)
+        u = (T - it * 2.5) * 0.8 - 1.0
+        u2 = 2.0 * u
+        noff = 560 * nroots * (nroots - 1)
+        for r in range(nroots):
+            for rwidx in range(2):
+                b = noff + (2 * r + rwidx) * 560 + it
+                c0 = rw[b + 520]  # 13*40
+                c1 = rw[b + 480]  # 12*40
+                for nn in range(11, 0, -2):
+                    c2 = rw[b + nn * 40] - c1
+                    c3 = c0 + c1 * u2
+                    c1 = c2 + c3 * u2
+                    c0 = rw[b + (nn - 1) * 40] - c3
+                v = c0 + c1 * u
+                if rwidx == 0:
+                    roots_out[base_idx + r] = np.float32(v)
+                else:
+                    weights_out[base_idx + r] = np.float32(v)
 
 
-def _compute_rys_for_triples(n_triples, triples_arr, sl, snp, spo,
-                              exps_f64, sx_f64, sy_f64, sz_f64,
-                              prim_offsets, rys_tables):
-    """Compute f64 Rys roots/weights for all primitives. Returns (roots, weights) as f32."""
-    rw64 = rys_tables['rw_table'].astype(np.float64)
+@nb.njit(cache=True, parallel=True)
+def _compute_rys_for_triples_nb(
+    n_triples, triples_arr, sl, snp, spo,
+    exps_f64, sx_f64, sy_f64, sz_f64,
+    prim_offsets,
+    rw, sr0, sr1, sw0, sw1, lr, lw,
+    roots_out, weights_out,
+):
+    """Walk shell triples, compute T per primitive, fill f32 Rys buffers.
 
-    # First: compute T and nroots for each primitive
-    # Total primitives from prim_counts
-    total_prims = 0
-    for t in range(n_triples):
-        ish, jsh, ksh = int(triples_arr[t, 0]), int(triples_arr[t, 1]), int(triples_arr[t, 2])
-        total_prims += int(snp[ish]) * int(snp[jsh]) * int(snp[ksh])
+    Fuses the per-primitive T computation with the Clenshaw evaluation,
+    eliminating the O(total_prims) intermediate T_arr/nroots_arr arrays
+    (~400 MB for caffeine def2-SVP). Parallelises across shell triples
+    via prange — each triple writes to a disjoint output region keyed
+    by prim_offsets[t], so there are no races.
 
-    T_arr = np.zeros(total_prims, dtype=np.float64)
-    nroots_arr = np.zeros(total_prims, dtype=np.int64)
-
-    pidx = 0
-    for t in range(n_triples):
-        ish, jsh, ksh = int(triples_arr[t, 0]), int(triples_arr[t, 1]), int(triples_arr[t, 2])
-        li = int(sl[ish]); lj = int(sl[jsh]); lk = int(sl[ksh])
+    Primitive walk order (outer pi -> mid pj -> inner pk) MUST match
+    the GPU kernel in _SOURCE_V2 so prim_idx stays in sync.
+    """
+    for t in nb.prange(n_triples):
+        ish = triples_arr[t, 0]
+        jsh = triples_arr[t, 1]
+        ksh = triples_arr[t, 2]
+        li = sl[ish]
+        lj = sl[jsh]
+        lk = sl[ksh]
         nroots = (li + 1 + lj + lk) // 2 + 1
-        npi = int(snp[ish]); npj = int(snp[jsh]); npk = int(snp[ksh])
-        rr_ab = float((sx_f64[ish]-sx_f64[jsh])**2 + (sy_f64[ish]-sy_f64[jsh])**2 + (sz_f64[ish]-sz_f64[jsh])**2)
-        for pi in range(npi):
-            ai = float(exps_f64[spo[ish]+pi])
-            for pj in range(npj):
-                aj = float(exps_f64[spo[jsh]+pj])
-                aij = ai + aj
-                px = (ai*sx_f64[ish]+aj*sx_f64[jsh])/aij
-                py = (ai*sy_f64[ish]+aj*sy_f64[jsh])/aij
-                pz = (ai*sz_f64[ish]+aj*sz_f64[jsh])/aij
-                for pk in range(npk):
-                    ak = float(exps_f64[spo[ksh]+pk])
-                    aijk = aij + ak
-                    PCx = px-sx_f64[ksh]; PCy = py-sy_f64[ksh]; PCz = pz-sz_f64[ksh]
-                    T_arr[pidx] = aij*ak/aijk * (PCx*PCx+PCy*PCy+PCz*PCz)
-                    nroots_arr[pidx] = nroots
-                    pidx += 1
+        npi = snp[ish]
+        npj = snp[jsh]
+        npk = snp[ksh]
+        offi = spo[ish]
+        offj = spo[jsh]
+        offk = spo[ksh]
+        ax = sx_f64[ish]; ay = sy_f64[ish]; az = sz_f64[ish]
+        bx = sx_f64[jsh]; byv = sy_f64[jsh]; bz = sz_f64[jsh]
+        cx = sx_f64[ksh]; cy = sy_f64[ksh]; cz = sz_f64[ksh]
 
-    roots_buf = np.zeros(total_prims * 6, dtype=np.float32)
-    weights_buf = np.zeros(total_prims * 6, dtype=np.float32)
-    _clenshaw_rys_batch(T_arr, nroots_arr, rw64,
-                         rys_tables['smallx_r0'].astype(np.float64),
-                         rys_tables['smallx_r1'].astype(np.float64),
-                         rys_tables['smallx_w0'].astype(np.float64),
-                         rys_tables['smallx_w1'].astype(np.float64),
-                         rys_tables['largex_r'].astype(np.float64),
-                         rys_tables['largex_w'].astype(np.float64),
-                         roots_buf, weights_buf)
-    return roots_buf, weights_buf, total_prims
+        prim_idx = prim_offsets[t]
+        for pi in range(npi):
+            ai = exps_f64[offi + pi]
+            for pj in range(npj):
+                aj = exps_f64[offj + pj]
+                aij = ai + aj
+                px = (ai * ax + aj * bx) / aij
+                py = (ai * ay + aj * byv) / aij
+                pz = (ai * az + aj * bz) / aij
+                for pk in range(npk):
+                    ak = exps_f64[offk + pk]
+                    aijk = aij + ak
+                    PCx = px - cx
+                    PCy = py - cy
+                    PCz = pz - cz
+                    T = aij * ak / aijk * (PCx * PCx + PCy * PCy + PCz * PCz)
+                    _clenshaw_rys_one(T, nroots, prim_idx * 6,
+                                      rw, sr0, sr1, sw0, sw1, lr, lw,
+                                      roots_out, weights_out)
+                    prim_idx += 1
 
 
 def _pack_shell_data(mol, auxmol):
@@ -496,13 +503,24 @@ def compute_int3c2e_ip1_v2(mol, auxmol, shls_slice=None):
         prim_offsets[1:] = np.cumsum(prim_counts_arr[:-1])
     total_prims = int(prim_counts_arr.sum())
 
-    # Compute Rys roots/weights on CPU in f64 (Numba Clenshaw)
+    # Compute Rys roots/weights on CPU in f64 (parallel Numba Clenshaw),
+    # writing directly into pre-allocated f32 buffers for the GPU kernel.
     rys_tables_raw = _load_rys_tables()
-    roots_buf, weights_buf, total_prims = _compute_rys_for_triples(
+    roots_buf = np.zeros(total_prims * 6, dtype=np.float32)
+    weights_buf = np.zeros(total_prims * 6, dtype=np.float32)
+    _compute_rys_for_triples_nb(
         n_triples, triples_arr, sl, snp, spo,
         exps.astype(np.float64), sx.astype(np.float64),
         sy.astype(np.float64), sz.astype(np.float64),
-        prim_offsets, rys_tables_raw)
+        prim_offsets,
+        rys_tables_raw['rw_table'].astype(np.float64),
+        rys_tables_raw['smallx_r0'].astype(np.float64),
+        rys_tables_raw['smallx_r1'].astype(np.float64),
+        rys_tables_raw['smallx_w0'].astype(np.float64),
+        rys_tables_raw['smallx_w1'].astype(np.float64),
+        rys_tables_raw['largex_r'].astype(np.float64),
+        rys_tables_raw['largex_w'].astype(np.float64),
+        roots_buf, weights_buf)
 
     # Launch Metal kernel
     THREADS = 64
@@ -604,9 +622,12 @@ def compute_int3c2e_ip1_v2(mol, auxmol, shls_slice=None):
                 C = _c2s_mat(l)
                 out[comp, :, :, s0:s1] = np.einsum('sk,ijk->ijs', C, tmp2[:, :, c0:c1])
 
-    return np.zeros((nao, nao, naux_slice, 3), dtype=np.float64, order='F').transpose(3, 0, 1, 2).__class__(
-        np.asfortranarray(np.zeros((nao, nao, naux_slice, 3), dtype=np.float64)).transpose(3, 0, 1, 2).__array_interface__['data'][0]
-    ) if False else (lambda: (r := np.zeros((nao, nao, naux_slice, 3), dtype=np.float64, order='F').transpose(3, 0, 1, 2), r.__setitem__(slice(None), out), r)[2])()
+    # Match getints' stride layout: (ni, nj, nk, ncomp) F-order then transpose,
+    # so fdrv's ctypes view sees the same strides as PySCF reference.
+    result_out = np.zeros((nao, nao, naux_slice, 3),
+                          dtype=np.float64, order='F').transpose(3, 0, 1, 2)
+    result_out[:] = out
+    return result_out
 
 
 def _cpu_fallback(mol, auxmol, shls_slice):
