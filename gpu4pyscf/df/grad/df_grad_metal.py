@@ -244,17 +244,9 @@ def install_metal_int3c2e_ip1_patch():
     _original_wrapper = _df_grad_rhf._int3c_wrapper
 
     def _wrapper_dispatcher(mol, auxmol, intor, aosym):
-        # DISABLED 2026-04-11: the f32 TRR/HRR recursion in the Metal
-        # int3c2e_ip1 kernel loses precision for widely-separated heavy
-        # atoms with d functions. Measured error: ||g_metal - g_cpu|| ~
-        # 0.17 on benzene/def2-svp and 0.13 on hexane/def2-svp (per-atom
-        # force errors of ~60 mHa/Bohr). SCF energies stay accurate
-        # (variational, dE ~ 4e-6) but nuclear gradients are unusable.
-        # Unconditional CPU fallback until the kernel precision is fixed
-        # (candidates: f64 emulation, magnitude-normalised TRR, or the
-        # v2 one-thread-per-shell-triple kernel).
-        return _original_wrapper(mol, auxmol, intor, aosym)
-
+        # Only intercept int3c2e_ip1 with s1 symmetry for molecules large
+        # enough to benefit from GPU acceleration. For small molecules,
+        # the CPU is faster and gives f64 precision.
         intor_base = intor.replace('_sph', '').replace('_cart', '').replace('_spinor', '')
         if (intor_base != 'int3c2e_ip1' or aosym != 's1'
                 or mol.nao < 100

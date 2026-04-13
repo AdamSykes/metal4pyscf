@@ -374,9 +374,12 @@ def _clenshaw_rys(T, nroots, rw, sr0, sr1, sw0, sw1, lr, lw, roots, weights, bas
             weights[base_idx + r] = sw0[s] + sw1[s] * T
     elif T > 99.0:
         # Asymptotic only for T beyond Chebyshev table range [0, 100).
-        # The original threshold (35+5*nroots) caused ~1% weight errors.
+        # CUDA reference (rys_roots.cu:43-48) applies t = sqrt(PIE4/x) to the
+        # weight, where PIE4 = pi/4. ROOT_LARGEX_W_DATA is normalized assuming
+        # this external factor; missing it gives a 2/sqrt(pi) = 1.1284 error
+        # on F_0 for every large-T primitive.
         ix = 1.0 / T
-        sqix = np.sqrt(ix)
+        sqix = np.sqrt(0.7853981633974483 * ix)   # sqrt(pi/4 * 1/T)
         for r in range(nroots):
             s = nroots * (nroots - 1) // 2 + r
             roots[base_idx + r] = lr[s] * ix

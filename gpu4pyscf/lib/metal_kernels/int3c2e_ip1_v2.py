@@ -298,8 +298,12 @@ def _clenshaw_rys_one(T, nroots, base_idx,
             roots_out[base_idx + r] = np.float32(sr0[s] + sr1[s] * T)
             weights_out[base_idx + r] = np.float32(sw0[s] + sw1[s] * T)
     elif T > 99.0:
+        # Asymptotic branch: CUDA multiplies the weight by sqrt(pi/(4T)),
+        # which the ROOT_LARGEX_W_DATA table assumes as an external factor.
+        # Omitting it produces a systematic 2/sqrt(pi) = 1.1284 error on F_0
+        # for every large-T primitive — see int3c2e_ip1.py:_clenshaw_rys.
         ix = 1.0 / T
-        sqix = np.sqrt(ix)
+        sqix = np.sqrt(0.7853981633974483 * ix)   # sqrt(pi/4 * 1/T)
         for r in range(nroots):
             s = nroots * (nroots - 1) // 2 + r
             roots_out[base_idx + r] = np.float32(lr[s] * ix)
