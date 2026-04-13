@@ -330,7 +330,7 @@ def _clenshaw_rys_one(T, nroots, base_idx,
                     weights_out[base_idx + r] = np.float32(v)
 
 
-@nb.njit(cache=True, parallel=True)
+@nb.njit(cache=True)
 def _compute_rys_for_triples_nb(
     n_triples, triples_arr, sl, snp, spo,
     exps_f64, sx_f64, sy_f64, sz_f64,
@@ -342,14 +342,19 @@ def _compute_rys_for_triples_nb(
 
     Fuses the per-primitive T computation with the Clenshaw evaluation,
     eliminating the O(total_prims) intermediate T_arr/nroots_arr arrays
-    (~400 MB for caffeine def2-SVP). Parallelises across shell triples
-    via prange — each triple writes to a disjoint output region keyed
-    by prim_offsets[t], so there are no races.
+    (~400 MB for caffeine def2-SVP).
 
     Primitive walk order (outer pi -> mid pj -> inner pk) MUST match
     the GPU kernel in _SOURCE_V2 so prim_idx stays in sync.
+
+    Note: parallel=True with nb.prange segfaults when calling the nested
+    _clenshaw_rys_one JIT function under Numba's parallel runtime. Each
+    triple writes to a disjoint output region so there's no logical race,
+    but the parallel machinery trips over the nested call. If this loop
+    becomes a bottleneck, restructure to inline the Clenshaw code before
+    re-enabling parallel execution.
     """
-    for t in nb.prange(n_triples):
+    for t in range(n_triples):
         ish = triples_arr[t, 0]
         jsh = triples_arr[t, 1]
         ksh = triples_arr[t, 2]
