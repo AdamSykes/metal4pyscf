@@ -904,22 +904,24 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
     (sx, sy, sz, sl_arr, snp_arr, spo_arr, exps_arr, coeffs_arr) = _pack_shell_data(mol, auxmol)
     tbl = _get_rys_tbl()
 
-    # Pre-allocate oversized buffers (Numba writes into them)
+    # Pre-allocate oversized buffers (Numba writes into them). Use np.empty —
+    # the Numba task builder writes sequentially and never reads uninitialized
+    # slots, and zeroing 1.4 GB costs ~55ms per call.
     max_tasks = 10_000_000  # generous upper bound
     max_triples = 2_000_000
-    tasks_flat = np.zeros(max_tasks * TASK_STRIDE, dtype=np.float32)
-    roots_flat = np.zeros(max_tasks * 6, dtype=np.float64)
-    weights_flat = np.zeros(max_tasks * 6, dtype=np.float64)
-    offsets_buf = np.zeros(max_tasks, dtype=np.int32)
-    m_ish = np.zeros(max_triples, dtype=np.int32)
-    m_jsh = np.zeros(max_triples, dtype=np.int32)
-    m_ksh = np.zeros(max_triples, dtype=np.int32)
-    m_ts = np.zeros(max_triples, dtype=np.int32)
-    m_tc = np.zeros(max_triples, dtype=np.int32)
-    m_nfi = np.zeros(max_triples, dtype=np.int32)
-    m_nfj = np.zeros(max_triples, dtype=np.int32)
-    m_nfk = np.zeros(max_triples, dtype=np.int32)
-    m_nout = np.zeros(max_triples, dtype=np.int32)
+    tasks_flat = np.empty(max_tasks * TASK_STRIDE, dtype=np.float32)
+    roots_flat = np.empty(max_tasks * 6, dtype=np.float64)
+    weights_flat = np.empty(max_tasks * 6, dtype=np.float64)
+    offsets_buf = np.empty(max_tasks, dtype=np.int32)
+    m_ish = np.empty(max_triples, dtype=np.int32)
+    m_jsh = np.empty(max_triples, dtype=np.int32)
+    m_ksh = np.empty(max_triples, dtype=np.int32)
+    m_ts = np.empty(max_triples, dtype=np.int32)
+    m_tc = np.empty(max_triples, dtype=np.int32)
+    m_nfi = np.empty(max_triples, dtype=np.int32)
+    m_nfj = np.empty(max_triples, dtype=np.int32)
+    m_nfk = np.empty(max_triples, dtype=np.int32)
+    m_nout = np.empty(max_triples, dtype=np.int32)
 
     n_tasks, n_meta, total_out = _build_3c_tasks_nb(
         nbas, shl0_aux, shl1_aux,
@@ -937,10 +939,6 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
 
     tasks = tasks_flat[:n_tasks * TASK_STRIDE].reshape(n_tasks, TASK_STRIDE)
     offsets = offsets_buf[:n_tasks]
-    meta = [(int(m_ish[i]), int(m_jsh[i]), int(m_ksh[i]),
-             int(m_ts[i]), int(m_tc[i]),
-             int(m_nfi[i]), int(m_nfj[i]), int(m_nfk[i]), int(m_nout[i]))
-            for i in range(n_meta)]
 
     # Phase B: run Metal kernel
     task_gpu = mx.array(tasks.ravel())
@@ -969,24 +967,24 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
     ao_loc_c = mol.ao_loc_nr(cart=True)
 
     out_cart = np.zeros((3, nao_cart, nao_cart, naux_slice_c), dtype=np.float64)
-    # Pack meta into arrays for fast Numba or vectorized access
-    n_meta = len(meta)
     if n_meta > 0:
-        m_i0 = np.array([ao_loc_c[m[0]] for m in meta], dtype=np.int32)
-        m_j0 = np.array([ao_loc_c[m[1]] for m in meta], dtype=np.int32)
-        m_k0 = np.array([aux_loc_c[m[2]] - p0_aux for m in meta], dtype=np.int32)
-        m_ts = np.array([m[3] for m in meta], dtype=np.int32)
-        m_tc = np.array([m[4] for m in meta], dtype=np.int32)
-        m_nfi = np.array([m[5] for m in meta], dtype=np.int32)
-        m_nfj = np.array([m[6] for m in meta], dtype=np.int32)
-        m_nfk = np.array([m[7] for m in meta], dtype=np.int32)
-        m_nout = np.array([m[8] for m in meta], dtype=np.int32)
+        # Slice directly from the Numba-filled arrays — avoids a Python list
+        # round-trip that previously cost ~260ms per call on benzene.
+        ish_s = m_ish[:n_meta]
+        jsh_s = m_jsh[:n_meta]
+        ksh_s = m_ksh[:n_meta]          # aux-local index
+        m_i0 = ao_loc_c[ish_s].astype(np.int32, copy=False)
+        m_j0 = ao_loc_c[jsh_s].astype(np.int32, copy=False)
+        m_k0 = (aux_loc_c[ksh_s] - p0_aux).astype(np.int32, copy=False)
         fac_tbl = np.array([_FAC_L[0], _FAC_L[1], _FAC_L[2], _FAC_L[3], _FAC_L[4]])
-        m_li = np.array([mol.bas_angular(m[0]) for m in meta], dtype=np.int32)
-        m_lj = np.array([mol.bas_angular(m[1]) for m in meta], dtype=np.int32)
-        m_lk = np.array([auxmol.bas_angular(m[2]) for m in meta], dtype=np.int32)
-        _accumulate_cart_nb(int_buf, offsets, m_i0, m_j0, m_k0, m_ts, m_tc,
-                            m_nfi, m_nfj, m_nfk, m_nout, m_li, m_lj, m_lk,
+        # sl_arr is packed: [0, nbas) are orbital shells, [nbas, nbas+nbas_aux) are aux
+        m_li = sl_arr[ish_s].astype(np.int32, copy=False)
+        m_lj = sl_arr[jsh_s].astype(np.int32, copy=False)
+        m_lk = sl_arr[ksh_s + nbas].astype(np.int32, copy=False)
+        _accumulate_cart_nb(int_buf, offsets, m_i0, m_j0, m_k0,
+                            m_ts[:n_meta], m_tc[:n_meta],
+                            m_nfi[:n_meta], m_nfj[:n_meta], m_nfk[:n_meta],
+                            m_nout[:n_meta], m_li, m_lj, m_lk,
                             fac_tbl, out_cart)
 
     if mol.cart:
