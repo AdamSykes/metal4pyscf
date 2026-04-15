@@ -83,21 +83,20 @@ _FAC_L = {0: sqrt(1.0 / (4 * pi)),
           2: 1.0, 3: 1.0, 4: 1.0}
 
 
-# (id(mol), shl0, shl1) -> {'copy': [...], 'transform': [...]} shell plans
-# Each entry is (s0, s1, c0, c1, C) with s/c offsets LOCAL to the slice.
-# 'copy' entries have C=None (l <= 1, cart == sph, just slice copy).
-# 'transform' entries have C=(nsph, ncart) matrix to einsum against.
+# (id(mol), shl0, shl1) -> cart2sph plan
+# {
+#   'copy':   list of (s0, s1, c0, c1) contiguous slice copies for l<=1,
+#   'groups': dict l -> {'cart': int[n*ncart], 'sph': int[n*nsph],
+#                         'C': (nsph, ncart), 'n': n, 'ncart', 'nsph'}
+# }
+# l<=1 shells stay as per-shell slice copies (contiguous memcpy is fast).
+# l>=2 shells group by l so a single matmul handles every shell with that
+# angular momentum (dropping ~50 einsum calls per axis to ~3).
 _C2S_PLAN_CACHE = {}
 
 
 def _cart2sph_plan(mol, ao_loc_c, ao_loc_s, shl0=None, shl1=None):
-    """Build / fetch per-shell cart->sph plan for a shell slice.
-
-    Cached by (id(mol), shl0, shl1). Separates l <= 1 shells (no transform
-    needed) from high-l shells (need cart2sph matrix), so the hot loop can
-    run straight numpy slice copies for the bulk and einsum only where
-    required.
-    """
+    """Build / fetch cart->sph plan for a shell slice, cached by mol+range."""
     if shl0 is None:
         shl0 = 0
     if shl1 is None:
@@ -109,7 +108,8 @@ def _cart2sph_plan(mol, ao_loc_c, ao_loc_s, shl0=None, shl1=None):
     from pyscf.gto.mole import cart2sph as _c2s
     c_start = ao_loc_c[shl0]
     s_start = ao_loc_s[shl0]
-    plan = {'copy': [], 'transform': []}
+    copies = []
+    group_cart, group_sph = {}, {}
     for ish in range(shl0, shl1):
         l = mol.bas_angular(ish)
         c0 = ao_loc_c[ish] - c_start
@@ -117,10 +117,21 @@ def _cart2sph_plan(mol, ao_loc_c, ao_loc_s, shl0=None, shl1=None):
         s0 = ao_loc_s[ish] - s_start
         s1 = ao_loc_s[ish + 1] - s_start
         if l <= 1:
-            plan['copy'].append((s0, s1, c0, c1, None))
+            copies.append((s0, s1, c0, c1))
         else:
-            C = np.asarray(_c2s(l, normalized='sp')).T  # (nsph, ncart)
-            plan['transform'].append((s0, s1, c0, c1, C))
+            group_cart.setdefault(l, []).append(np.arange(c0, c1, dtype=np.int64))
+            group_sph.setdefault(l, []).append(np.arange(s0, s1, dtype=np.int64))
+    plan = {'copy': copies, 'groups': {}}
+    for l, cart_list in group_cart.items():
+        C = np.asarray(_c2s(l, normalized='sp')).T  # (nsph, ncart)
+        plan['groups'][l] = {
+            'cart': np.concatenate(cart_list),
+            'sph': np.concatenate(group_sph[l]),
+            'C': C,
+            'n': len(cart_list),
+            'ncart': C.shape[1],
+            'nsph': C.shape[0],
+        }
     _C2S_PLAN_CACHE[key] = plan
     return plan
 
@@ -1057,27 +1068,36 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
     orb_plan = _cart2sph_plan(mol, ao_loc_c, ao_loc_s)
     aux_plan = _cart2sph_plan(auxmol, aux_loc_c, aux_loc_s, shl0_aux, shl1_aux)
 
-    # Axis i: (3, nao_cart, nao_cart, naux_slice_c) -> (3, nao, nao_cart, naux_slice_c)
+    # Axis i: out_cart[q, ic, jc, kc] -> tmp1[q, is, jc, kc]
     tmp1 = np.empty((3, nao, nao_cart, naux_slice_c), dtype=np.float64)
-    for s0, s1, c0, c1, C in orb_plan['copy']:
+    for s0, s1, c0, c1 in orb_plan['copy']:
         tmp1[:, s0:s1] = out_cart[:, c0:c1]
-    for s0, s1, c0, c1, C in orb_plan['transform']:
-        # einsum over i axis, batched over comp
-        tmp1[:, s0:s1] = np.einsum('si,qijk->qsjk', C, out_cart[:, c0:c1])
+    for g in orb_plan['groups'].values():
+        # Gather cart slabs for this l, reshape to expose shell/ncart axes,
+        # matmul with C.T, scatter back. One matmul handles all shells of
+        # the same l in a single BLAS call.
+        sub = out_cart[:, g['cart']].reshape(3, g['n'], g['ncart'], nao_cart, naux_slice_c)
+        tr = np.tensordot(sub, g['C'].T, axes=([2], [0]))  # (3, n, nao_cart, naux_slice_c, nsph)
+        tmp1[:, g['sph']] = tr.transpose(0, 1, 4, 2, 3).reshape(3, g['n'] * g['nsph'], nao_cart, naux_slice_c)
 
-    # Axis j: (3, nao, nao_cart, naux_slice_c) -> (3, nao, nao, naux_slice_c)
+    # Axis j: tmp1[q, i, jc, kc] -> tmp2[q, i, js, kc]
     tmp2 = np.empty((3, nao, nao, naux_slice_c), dtype=np.float64)
-    for s0, s1, c0, c1, C in orb_plan['copy']:
+    for s0, s1, c0, c1 in orb_plan['copy']:
         tmp2[:, :, s0:s1] = tmp1[:, :, c0:c1]
-    for s0, s1, c0, c1, C in orb_plan['transform']:
-        tmp2[:, :, s0:s1] = np.einsum('sj,qijk->qisk', C, tmp1[:, :, c0:c1])
+    for g in orb_plan['groups'].values():
+        sub = tmp1[:, :, g['cart']].reshape(3, nao, g['n'], g['ncart'], naux_slice_c)
+        tr = np.tensordot(sub, g['C'].T, axes=([3], [0]))  # (3, nao, n, naux_slice_c, nsph)
+        tmp2[:, :, g['sph']] = tr.transpose(0, 1, 2, 4, 3).reshape(3, nao, g['n'] * g['nsph'], naux_slice_c)
 
-    # Axis k (aux): (3, nao, nao, naux_slice_c) -> (3, nao, nao, naux_slice)
+    # Axis k (aux): tmp2[q, i, j, kc] -> out[q, i, j, ks]. Contracted axis is
+    # last, so plain matmul with C.T handles it with broadcasting.
     out = np.empty((3, nao, nao, naux_slice), dtype=np.float64)
-    for s0, s1, c0, c1, C in aux_plan['copy']:
+    for s0, s1, c0, c1 in aux_plan['copy']:
         out[:, :, :, s0:s1] = tmp2[:, :, :, c0:c1]
-    for s0, s1, c0, c1, C in aux_plan['transform']:
-        out[:, :, :, s0:s1] = np.einsum('sk,qijk->qijs', C, tmp2[:, :, :, c0:c1])
+    for g in aux_plan['groups'].values():
+        sub = tmp2[:, :, :, g['cart']].reshape(3, nao, nao, g['n'], g['ncart'])
+        tr = sub @ g['C'].T          # (3, nao, nao, n, nsph)
+        out[:, :, :, g['sph']] = tr.reshape(3, nao, nao, g['n'] * g['nsph'])
 
     # Match getints' stride layout: (ni, nj, nk, ncomp) F-order then transpose
     result = np.zeros((nao, nao, naux_slice, 3),
