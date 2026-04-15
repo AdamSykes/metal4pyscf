@@ -82,6 +82,48 @@ _FAC_L = {0: sqrt(1.0 / (4 * pi)),
           1: sqrt(3.0 / (4 * pi)),
           2: 1.0, 3: 1.0, 4: 1.0}
 
+
+# (id(mol), shl0, shl1) -> {'copy': [...], 'transform': [...]} shell plans
+# Each entry is (s0, s1, c0, c1, C) with s/c offsets LOCAL to the slice.
+# 'copy' entries have C=None (l <= 1, cart == sph, just slice copy).
+# 'transform' entries have C=(nsph, ncart) matrix to einsum against.
+_C2S_PLAN_CACHE = {}
+
+
+def _cart2sph_plan(mol, ao_loc_c, ao_loc_s, shl0=None, shl1=None):
+    """Build / fetch per-shell cart->sph plan for a shell slice.
+
+    Cached by (id(mol), shl0, shl1). Separates l <= 1 shells (no transform
+    needed) from high-l shells (need cart2sph matrix), so the hot loop can
+    run straight numpy slice copies for the bulk and einsum only where
+    required.
+    """
+    if shl0 is None:
+        shl0 = 0
+    if shl1 is None:
+        shl1 = mol.nbas
+    key = (id(mol), shl0, shl1)
+    hit = _C2S_PLAN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    from pyscf.gto.mole import cart2sph as _c2s
+    c_start = ao_loc_c[shl0]
+    s_start = ao_loc_s[shl0]
+    plan = {'copy': [], 'transform': []}
+    for ish in range(shl0, shl1):
+        l = mol.bas_angular(ish)
+        c0 = ao_loc_c[ish] - c_start
+        c1 = ao_loc_c[ish + 1] - c_start
+        s0 = ao_loc_s[ish] - s_start
+        s1 = ao_loc_s[ish + 1] - s_start
+        if l <= 1:
+            plan['copy'].append((s0, s1, c0, c1, None))
+        else:
+            C = np.asarray(_c2s(l, normalized='sp')).T  # (nsph, ncart)
+            plan['transform'].append((s0, s1, c0, c1, C))
+    _C2S_PLAN_CACHE[key] = plan
+    return plan
+
 # Task layout (36 floats per primitive triple).
 # f32 inputs with f64-accurate Rys roots (truncated to f32 after Clenshaw).
 # Chebyshev table accurate to 1e-7 for nroots ≤ 5 (threshold=99).
@@ -997,57 +1039,44 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
         result[:] = out_cart
         return result
 
-    # Cart-to-spherical transform for orbital indices (i, j) and aux (k)
-    from pyscf.gto.mole import cart2sph as _c2s
-
-    def _c2s_mat(l):
-        return np.asarray(_c2s(l, normalized='sp')).T  # (nsph, ncart)
-
+    # Cart-to-spherical transform for orbital indices (i, j) and aux (k).
+    # Most shells have l <= 1 where cart == sph (copy), and only high-l
+    # shells need an actual matrix multiply. Cache per-mol shell plans so
+    # the second/third calls skip recomputing ranges and cart2sph matrices,
+    # and batch over the 3 derivative components (one einsum per high-l
+    # shell instead of three) to amortise Python/einsum overhead.
     nao = mol.nao
-    naux_slice = auxmol.ao_loc_nr()[shl1_aux] - auxmol.ao_loc_nr()[shl0_aux]
-    out = np.zeros((3, nao, nao, naux_slice), dtype=np.float64)
-
     ao_loc_s = mol.ao_loc_nr()
     aux_loc_s = auxmol.ao_loc_nr()
+    naux_slice = aux_loc_s[shl1_aux] - aux_loc_s[shl0_aux]
     p0_aux_s = aux_loc_s[shl0_aux]
 
-    for comp in range(3):
-        # Transform i (first orbital index)
-        tmp1 = np.zeros((nao, nao_cart, naux_slice_c), dtype=np.float64)
-        for ish in range(mol.nbas):
-            l = mol.bas_angular(ish)
-            c0 = ao_loc_c[ish]; c1 = ao_loc_c[ish + 1]
-            s0 = ao_loc_s[ish]; s1 = ao_loc_s[ish + 1]
-            if l <= 1:
-                tmp1[s0:s1] = out_cart[comp, c0:c1]
-            else:
-                C = _c2s_mat(l)
-                tmp1[s0:s1] = np.einsum('si,ijk->sjk', C, out_cart[comp, c0:c1])
+    orb_plan = _cart2sph_plan(mol, ao_loc_c, ao_loc_s)
+    aux_plan = _cart2sph_plan(auxmol, aux_loc_c, aux_loc_s, shl0_aux, shl1_aux)
 
-        # Transform j (second orbital index)
-        tmp2 = np.zeros((nao, nao, naux_slice_c), dtype=np.float64)
-        for jsh in range(mol.nbas):
-            l = mol.bas_angular(jsh)
-            c0 = ao_loc_c[jsh]; c1 = ao_loc_c[jsh + 1]
-            s0 = ao_loc_s[jsh]; s1 = ao_loc_s[jsh + 1]
-            if l <= 1:
-                tmp2[:, s0:s1] = tmp1[:, c0:c1]
-            else:
-                C = _c2s_mat(l)
-                tmp2[:, s0:s1] = np.einsum('sj,ijk->isk', C, tmp1[:, c0:c1])
+    # Axis i: (3, nao_cart, nao_cart, naux_slice_c) -> (3, nao, nao_cart, naux_slice_c)
+    tmp1 = np.empty((3, nao, nao_cart, naux_slice_c), dtype=np.float64)
+    for s0, s1, c0, c1, C in orb_plan['copy']:
+        tmp1[:, s0:s1] = out_cart[:, c0:c1]
+    for s0, s1, c0, c1, C in orb_plan['transform']:
+        # einsum over i axis, batched over comp
+        tmp1[:, s0:s1] = np.einsum('si,qijk->qsjk', C, out_cart[:, c0:c1])
 
-        # Transform k (aux index)
-        for ksh in range(shl0_aux, shl1_aux):
-            l = auxmol.bas_angular(ksh)
-            c0 = aux_loc_c[ksh] - p0_aux; c1 = aux_loc_c[ksh + 1] - p0_aux
-            s0 = aux_loc_s[ksh] - p0_aux_s; s1 = aux_loc_s[ksh + 1] - p0_aux_s
-            if l <= 1:
-                out[comp, :, :, s0:s1] = tmp2[:, :, c0:c1]
-            else:
-                C = _c2s_mat(l)
-                out[comp, :, :, s0:s1] = np.einsum('sk,ijk->ijs', C, tmp2[:, :, c0:c1])
+    # Axis j: (3, nao, nao_cart, naux_slice_c) -> (3, nao, nao, naux_slice_c)
+    tmp2 = np.empty((3, nao, nao, naux_slice_c), dtype=np.float64)
+    for s0, s1, c0, c1, C in orb_plan['copy']:
+        tmp2[:, :, s0:s1] = tmp1[:, :, c0:c1]
+    for s0, s1, c0, c1, C in orb_plan['transform']:
+        tmp2[:, :, s0:s1] = np.einsum('sj,qijk->qisk', C, tmp1[:, :, c0:c1])
 
-    # Match getints' stride layout: (ni, nj, nk, ncomp) F-order → transpose
+    # Axis k (aux): (3, nao, nao, naux_slice_c) -> (3, nao, nao, naux_slice)
+    out = np.empty((3, nao, nao, naux_slice), dtype=np.float64)
+    for s0, s1, c0, c1, C in aux_plan['copy']:
+        out[:, :, :, s0:s1] = tmp2[:, :, :, c0:c1]
+    for s0, s1, c0, c1, C in aux_plan['transform']:
+        out[:, :, :, s0:s1] = np.einsum('sk,qijk->qijs', C, tmp2[:, :, :, c0:c1])
+
+    # Match getints' stride layout: (ni, nj, nk, ncomp) F-order then transpose
     result = np.zeros((nao, nao, naux_slice, 3),
                       dtype=np.float64, order='F').transpose(3, 0, 1, 2)
     result[:] = out
