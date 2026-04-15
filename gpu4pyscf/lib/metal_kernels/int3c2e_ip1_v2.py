@@ -368,21 +368,27 @@ def _compute_rys_for_triples_nb(
         offi = spo[ish]
         offj = spo[jsh]
         offk = spo[ksh]
-        ax = sx_f64[ish]; ay = sy_f64[ish]; az = sz_f64[ish]
-        bx = sx_f64[jsh]; byv = sy_f64[jsh]; bz = sz_f64[jsh]
-        cx = sx_f64[ksh]; cy = sy_f64[ksh]; cz = sz_f64[ksh]
+        ax = sx_f64[ish]
+        ay = sy_f64[ish]
+        az = sz_f64[ish]
+        bx = sx_f64[jsh]
+        byv = sy_f64[jsh]
+        bz = sz_f64[jsh]
+        cx = sx_f64[ksh]
+        cy = sy_f64[ksh]
+        cz = sz_f64[ksh]
 
         prim_idx = prim_offsets[t]
-        for pi in range(npi):
-            ai = exps_f64[offi + pi]
-            for pj in range(npj):
-                aj = exps_f64[offj + pj]
+        for p_i in range(npi):
+            ai = exps_f64[offi + p_i]
+            for p_j in range(npj):
+                aj = exps_f64[offj + p_j]
                 aij = ai + aj
                 px = (ai * ax + aj * bx) / aij
                 py = (ai * ay + aj * byv) / aij
                 pz = (ai * az + aj * bz) / aij
-                for pk in range(npk):
-                    ak = exps_f64[offk + pk]
+                for p_k in range(npk):
+                    ak = exps_f64[offk + p_k]
                     aijk = aij + ak
                     PCx = px - cx
                     PCy = py - cy
@@ -412,7 +418,9 @@ def _pack_shell_data(mol, auxmol):
 
     for ish in range(nbas_orb):
         c = mol.atom_coord(mol.bas_atom(ish))
-        shell_x[ish] = c[0]; shell_y[ish] = c[1]; shell_z[ish] = c[2]
+        shell_x[ish] = c[0]
+        shell_y[ish] = c[1]
+        shell_z[ish] = c[2]
         shell_l[ish] = mol.bas_angular(ish)
         n = mol.bas_nprim(ish)
         shell_nprim[ish] = n
@@ -424,7 +432,9 @@ def _pack_shell_data(mol, auxmol):
     for ksh in range(nbas_aux):
         idx = nbas_orb + ksh
         c = auxmol.atom_coord(auxmol.bas_atom(ksh))
-        shell_x[idx] = c[0]; shell_y[idx] = c[1]; shell_z[idx] = c[2]
+        shell_x[idx] = c[0]
+        shell_y[idx] = c[1]
+        shell_z[idx] = c[2]
         shell_l[idx] = auxmol.bas_angular(ksh)
         n = auxmol.bas_nprim(ksh)
         shell_nprim[idx] = n
@@ -561,11 +571,19 @@ def compute_int3c2e_ip1_v2(mol, auxmol, shls_slice=None):
         for t in range(len(offsets)):
             off = offsets[t]
             sz = out_sizes[t]
-            ish = triples[t*6]; jsh = triples[t*6+1]; ksh_idx = triples[t*6+2] - nbas_orb
-            i0 = triples[t*6+3]; j0 = triples[t*6+4]; k0 = triples[t*6+5]
-            li = sl_orb[ish]; lj = sl_orb[jsh]; lk = sl_aux[ksh_idx]
+            ish = triples[t*6]
+            jsh = triples[t*6+1]
+            ksh_idx = triples[t*6+2] - nbas_orb
+            i0 = triples[t*6+3]
+            j0 = triples[t*6+4]
+            k0 = triples[t*6+5]
+            li = sl_orb[ish]
+            lj = sl_orb[jsh]
+            lk = sl_aux[ksh_idx]
             fac = fac_arr[li] * fac_arr[lj] * fac_arr[lk]
-            nfi = (li+1)*(li+2)//2; nfj = (lj+1)*(lj+2)//2; nfk = (lk+1)*(lk+2)//2
+            nfi = (li+1)*(li+2)//2
+            nfj = (lj+1)*(lj+2)//2
+            nfk = (lk+1)*(lk+2)//2
             cs = nfi * nfj * nfk
             for idx in range(sz):
                 comp = idx // cs
@@ -604,8 +622,10 @@ def compute_int3c2e_ip1_v2(mol, auxmol, shls_slice=None):
         tmp1 = np.zeros((nao, nao_cart, naux_slice_c), dtype=np.float64)
         for ish in range(nbas):
             l = mol.bas_angular(ish)
-            c0 = ao_loc_c[ish]; c1 = ao_loc_c[ish+1]
-            s0 = ao_loc_s[ish]; s1 = ao_loc_s[ish+1]
+            c0 = ao_loc_c[ish]
+            c1 = ao_loc_c[ish+1]
+            s0 = ao_loc_s[ish]
+            s1 = ao_loc_s[ish+1]
             if l <= 1:
                 tmp1[s0:s1] = out_cart[comp, c0:c1]
             else:
@@ -614,8 +634,10 @@ def compute_int3c2e_ip1_v2(mol, auxmol, shls_slice=None):
         tmp2 = np.zeros((nao, nao, naux_slice_c), dtype=np.float64)
         for jsh in range(nbas):
             l = mol.bas_angular(jsh)
-            c0 = ao_loc_c[jsh]; c1 = ao_loc_c[jsh+1]
-            s0 = ao_loc_s[jsh]; s1 = ao_loc_s[jsh+1]
+            c0 = ao_loc_c[jsh]
+            c1 = ao_loc_c[jsh+1]
+            s0 = ao_loc_s[jsh]
+            s1 = ao_loc_s[jsh+1]
             if l <= 1:
                 tmp2[:, s0:s1] = tmp1[:, c0:c1]
             else:
@@ -623,8 +645,10 @@ def compute_int3c2e_ip1_v2(mol, auxmol, shls_slice=None):
                 tmp2[:, s0:s1] = np.einsum('sj,ijk->isk', C, tmp1[:, c0:c1])
         for ksh in range(shl0_aux, shl1_aux):
             l = auxmol.bas_angular(ksh)
-            c0 = aux_loc_c[ksh] - p0_aux; c1 = aux_loc_c[ksh+1] - p0_aux
-            s0 = aux_loc_s[ksh] - p0_aux_s; s1 = aux_loc_s[ksh+1] - p0_aux_s
+            c0 = aux_loc_c[ksh] - p0_aux
+            c1 = aux_loc_c[ksh+1] - p0_aux
+            s0 = aux_loc_s[ksh] - p0_aux_s
+            s1 = aux_loc_s[ksh+1] - p0_aux_s
             if l <= 1:
                 out[comp, :, :, s0:s1] = tmp2[:, :, c0:c1]
             else:
