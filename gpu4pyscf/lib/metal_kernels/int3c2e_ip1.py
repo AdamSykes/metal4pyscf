@@ -998,7 +998,10 @@ def compute_int3c2e_ip1_metal(mol, auxmol, shls_slice=None):
         template=[('n_tasks', n_tasks), ('TASK_STRIDE', TASK_STRIDE)],
     )
     mx.eval(result[0])
-    int_buf = np.array(result[0]).astype(np.float64)
+    # Keep int_buf in f32 — the GPU kernel runs in f32, so f64 cast here is
+    # cosmetic and costs ~24ms per call (~108 MB conversion on benzene).
+    # _accumulate_cart_nb sums into an f64 output, which promotes automatically.
+    int_buf = np.asarray(result[0])
 
     # Phase C: accumulate into output tensor (Cartesian first, then cart2sph)
     nao_cart = mol.nao_cart()
